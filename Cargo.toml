@@ -1,0 +1,27 @@
+[package]
+name = "streaming-diskann"
+version = "0.1.0"
+edition = "2021"
+description = "Postgres-free StreamingDiskANN core with storage traits, memory backend, and conformance tests."
+license = "PostgreSQL"
+readme = "README.md"
+documentation = "https://docs.rs/streaming-diskann"
+repository = "https://github.com/danthegoodman1/streaming-diskann"
+homepage = "https://github.com/danthegoodman1/streaming-diskann"
+keywords = ["ann", "diskann", "vector-search", "search"]
+categories = ["algorithms", "data-structures"]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "src/**",
+    "examples/**",
+    "tests/**",
+    "docs/**",
+]
+
+[lib]
+name = "streaming_diskann"
+path = "src/lib.rs"
