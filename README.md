@@ -1,109 +1,122 @@
 # streaming-diskann
 
-`streaming-diskann` is a Postgres-free StreamingDiskANN crate. It contains the
-algorithm-facing core types, memory reference backend, public storage traits,
-conformance helpers, and benchmark harness used to keep the standalone
-implementation testable without a PostgreSQL server.
+[crates.io](https://crates.io/crates/streaming-diskann) |
+[docs.rs](https://docs.rs/streaming-diskann) |
+[GitHub](https://github.com/danthegoodman1/streaming-diskann)
 
-The crate intentionally has no `pgrx`, PostgreSQL page, WAL, SQL parser, or heap
-tuple dependencies. Backends provide storage through traits in
-`streaming_diskann::storage`; graph search reads a `ManifestSnapshot`, routing
-nodes through `NodeReader`, and full vectors through `FullVectorReader`.
+`streaming-diskann` is a Postgres-free Rust crate for building and querying a
+StreamingDiskANN-style vector index. It was extracted from the StreamingDiskANN
+implementation in [timescale/pgvectorscale](https://github.com/timescale/pgvectorscale)
+and refactored so storage is provided through explicit Rust traits instead of
+Postgres pages, WAL, heap pointers, or extension callbacks.
 
-## Use As A Dependency
+The crate provides:
 
-From another Cargo project, add the crate with:
+- `StreamingDiskAnnIndex`, a storage-backed index coordinator for build, search,
+  insert, delete, and mutation replay.
+- Storage traits for manifests, routing-node reads, full-vector reads,
+  quantizers, immutable segments, hot deltas, and mutation logs.
+- A memory-backed reference implementation for examples and tests.
+- A public conformance suite that custom storage backends can run.
+- A small benchmark harness and a minimal direct-use example.
+
+## Install
 
 ```bash
 cargo add streaming-diskann
 ```
 
-For the git version:
+The package name is `streaming-diskann`; the Rust crate name is
+`streaming_diskann`.
 
-```bash
-cargo add streaming-diskann --git https://github.com/danthegoodman1/streaming-diskann
-```
-
-For this local checkout:
-
-```bash
-cargo add streaming-diskann --path /Users/dangoodman/code/streaming_disk_ann
-```
-
-Then import it with the Rust crate name:
+## Minimal Example
 
 ```rust
-use streaming_diskann::{IndexConfig, SearchOptions, StreamingDiskAnnIndex};
+use streaming_diskann::{
+    IndexConfig, LabelSet, SearchOptions, StreamingDiskAnnIndex, VectorInput,
+};
+
+fn main() -> streaming_diskann::Result<()> {
+    let index = StreamingDiskAnnIndex::new_memory(IndexConfig::new(3))?;
+
+    index.bulk_build([
+        VectorInput::new(1001_u64, vec![0.0, 0.0, 0.0], LabelSet::default()),
+        VectorInput::new(1002_u64, vec![1.0, 0.0, 0.0], LabelSet::default()),
+        VectorInput::new(1003_u64, vec![0.0, 1.0, 0.0], LabelSet::default()),
+    ])?;
+
+    let hits = index.search(&[0.9, 0.1, 0.0], SearchOptions::new(2, 8))?;
+
+    for hit in hits {
+        println!(
+            "external_id={} distance={:.4}",
+            hit.external_id.get(),
+            hit.distance
+        );
+    }
+
+    Ok(())
+}
 ```
 
-## Development Commands
-
-Run these commands from this repository root.
+Run the repository example:
 
 ```bash
-cargo fmt --check
 cargo run --example basic
-cargo test
-cargo test --test conformance_memory
-cargo run --example bench -- --iters 5
-cargo tree
-cargo package --allow-dirty
 ```
 
-For a CI no-Postgres dependency audit, use a shell step like:
+## Storage Model
 
-```bash
-set -euo pipefail
-cargo tree --edges normal,build,dev | tee /tmp/streaming_diskann.tree
-if grep -E '(pgrx|postgres|pg_sys)' /tmp/streaming_diskann.tree; then
-    echo "streaming_diskann must stay Postgres-free" >&2
-    exit 1
-fi
-```
+Queries pin a `ManifestSnapshot` and resolve graph nodes through `NodeReader`.
+Routing reads return `RoutingNodeRecord` values: routing vector, neighbor IDs,
+labels, and external ID. Full vectors are intentionally separate and are read
+through `FullVectorReader` only for exact rescoring.
 
-`cargo check --tests` is the broadest local compatibility check that does not
-start a PostgreSQL server.
+This split lets a backend keep metadata, graph routing data, full embeddings,
+quantizer state, hot mutable deltas, and mutation logs in different systems. For
+example, a production backend could use an LSM for manifest and mutation state,
+object storage for immutable graph segments, and a separate store for full
+vectors while preserving the same query semantics.
 
-## Conformance
+## Custom Backends
 
-Backend implementors should call the public conformance helpers from their own
-tests:
+Backend authors implement the storage traits in `streaming_diskann::storage`.
+The public conformance helpers exercise the expected snapshot, bounded-read,
+full-vector, quantizer, hot-delta, mutation-log, and index-orchestration
+contracts.
 
 ```rust
 use streaming_diskann::graph::StartNodes;
 use streaming_diskann::storage::{conformance, MemoryStorage};
+use streaming_diskann::{IndexConfig, Result};
 
-fn new_storage(
-    config: streaming_diskann::IndexConfig,
-    start_nodes: StartNodes,
-) -> streaming_diskann::Result<MemoryStorage> {
+fn new_storage(config: IndexConfig, start_nodes: StartNodes) -> Result<MemoryStorage> {
     MemoryStorage::empty(config, start_nodes)
 }
 
-fn main() -> streaming_diskann::Result<()> {
+fn main() -> Result<()> {
     conformance::assert_storage_trait_conformance(new_storage)?;
     conformance::assert_index_storage_conformance(new_storage)?;
     Ok(())
 }
 ```
 
-Passing conformance means the backend satisfies this crate's snapshot,
-bounded-read, full-vector, quantizer, hot-delta, mutation-log, and
-index-orchestration contracts for deterministic fixtures. It does not certify
-remote latency, cache internals beyond `NodeReader` semantics, crash recovery
-outside the shared mutation-log API, or backend-specific durability.
+Passing conformance means a backend satisfies this crate's deterministic storage
+and index contracts. It does not certify backend-specific durability, remote
+latency, production cache policy, or operational tuning.
 
-## Migration Notes
+## Development
 
-The current extension still owns all PostgreSQL behavior. See
-`docs/streaming-diskann-migration.md` for module provenance, the mapping between
-`pgvectorscale/src/access_method` and this crate, and the adapter work required
-before the extension can consume this standalone core.
+```bash
+cargo fmt --check
+cargo test
+cargo test --test conformance_memory
+cargo run --example basic
+cargo run --example bench -- --iters 5
+cargo package
+```
 
-## Origin And License
+## License
 
-This crate was extracted from the StreamingDiskANN implementation in
-[timescale/pgvectorscale](https://github.com/timescale/pgvectorscale), with the
-Postgres extension mechanics replaced by explicit storage traits. The copied and
-adapted code keeps the same PostgreSQL License as the original repository; see
-[LICENSE](LICENSE) and [NOTICE](NOTICE).
+This crate is licensed under the PostgreSQL License, matching the original
+pgvectorscale source. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
