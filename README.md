@@ -78,6 +78,35 @@ example, a production backend could use an LSM for manifest and mutation state,
 object storage for immutable graph segments, and a separate store for full
 vectors while preserving the same query semantics.
 
+### Storage Interfaces
+
+| Interface | Query hot path | Write hot path | Responsibility | Required guarantees |
+| --- | --- | --- | --- | --- |
+| `MetadataStore` | Light | Yes | Stores the latest `ManifestSnapshot`. | `load_snapshot` returns a coherent published snapshot. `compare_and_publish` is an atomic CAS on `ManifestVersion`; on success it assigns the next version and makes the replacement snapshot the visibility boundary for later readers. |
+| `NodeReader` | Yes | Yes | Reads routing-path node records: routing vector, neighbor IDs, labels, and external ID, including records and overlays from the snapshot's published hot delta. | Reads only data visible through the supplied snapshot, returns one `NodeRead` per requested ID in request order, enforces read-batch and query-byte budgets, and does not fetch full vectors. |
+| `FullVectorReader` | If rescoring | Usually | Reads full vectors for exact candidate rescoring, including inserted vectors from the snapshot's published hot delta. | Uses the same snapshot visibility and tombstone rules as `NodeReader`, returns one `FullVectorRead` per requested ID in request order, and enforces rescore-count, full-vector-byte, and query-byte budgets. |
+| `QuantizerStore` | Cache miss/SBQ | Build/SBQ | Stores quantizer models referenced by manifests. | Returned references are exact scope/version handles. Quantizers must be durable before a manifest that references them is published and immutable after publication. |
+| `MutableNodeStore` | No | Yes | Stages online inserts, neighbor rewrite overlays, tombstones, and start-node updates. | Staged data is not visible to readers until published through a hot delta and manifest. The current trait shape assumes one writer per index, or backend-provided serialization/isolated drafts for concurrent writers. |
+| `HotDeltaStore` | Data yes; trait no | Yes | Freezes staged mutable writes into a `HotDeltaRef`; query code reads the resulting data through `NodeReader` and `FullVectorReader`, not by calling `HotDeltaStore`. | `publish_hot_delta` makes a complete immutable delta addressable by ref; all data reachable from that ref must be durable/readable before the global manifest can point to it. |
+| `MutationLog` | No | Yes | Records online mutations for recovery or replication. | Appends are durable and replayable in one total order. Offsets must be unique and monotonically increasing in replay order; they may have gaps. Checkpoints mark durable replay progress, and truncated offsets must report unavailable. |
+| `ImmutableSegmentStore` | No direct call | Bulk/compaction | Persists complete immutable graph segments from bulk build or compaction. | A returned segment ref points to a fully written immutable segment. The segment is invisible until a manifest CAS publishes it and must not be modified in place after publication. |
+
+### Visibility And Atomicity
+
+Readers discover graph state only through a `ManifestSnapshot`; they must not
+list object-store prefixes, read "latest" files, or merge in unreferenced draft
+state. A query sees exactly the immutable segments, hot-delta ref, tombstone
+epoch, start nodes, config, and quantizer refs in the snapshot it was given.
+The manifest stores a `HotDeltaRef`, not hot-delta contents: the backend's
+reader implementations use that ref to locate inserted node records, full
+vectors, neighbor rewrite overlays, and tombstones.
+
+Writers should persist physical data first and publish metadata last. For
+example, an insert appends the mutation log, writes staged node/full-vector data
+and rewrite overlays, freezes those writes as a hot delta, then atomically CASes
+the manifest to reference that delta. If a writer crashes before the manifest
+publish, the staged data may be garbage-collected because no reader can see it.
+
 ## Custom Backends
 
 Backend authors implement the storage traits in `streaming_diskann::storage`.
