@@ -3,18 +3,55 @@
 export declare class NativeIndex {
   bulkBuild(items: Array<NativeItem>): Promise<unknown>
   search(vector: Float32Array, options: NativeSearchOptions): Promise<unknown>
+  /**
+   * Searches a pinned manifest snapshot instead of the latest published
+   * state. Expired snapshots reject with `SNAPSHOT_EXPIRED`; snapshots
+   * taken from a different index handle (including a previous open of the
+   * same named index) reject with `INVALID_ARGUMENT` — segment numbering
+   * could coincide across indexes and silently return wrong results.
+   */
+  searchWithSnapshot(vector: Float32Array, options: NativeSearchOptions, snapshot: NativeSnapshot): Promise<unknown>
+  /**
+   * Pins the currently published manifest snapshot. Cheap for the memory
+   * provider (a metadata clone under a mutex), so it runs synchronously.
+   */
+  snapshot(): NativeSnapshot
   insert(item: NativeItem): Promise<unknown>
   delete(id: bigint): Promise<unknown>
   /**
    * Releases the native handle. Later calls on this instance fail with a
    * clear "index is closed" error, which the async wrapper surfaces as a
-   * promise rejection.
+   * promise rejection. Named memory indexes stay registered (and can be
+   * re-opened) after close.
    */
   close(): void
 }
 
-/** Creates an index for a storage-provider URI. Only `memory:` is supported. */
+/**
+ * Opaque pinned manifest snapshot handle backing the JS `Snapshot` class.
+ *
+ * Holds a full [`ManifestSnapshot`] value (plain metadata, no storage
+ * references), so its lifetime is simply the JS object's lifetime: it is
+ * freed by garbage collection and needs no explicit release. Pinning a
+ * snapshot does **not** prevent the memory provider from garbage-collecting
+ * the hot-delta state it refers to: once more than one publish has elapsed
+ * since the snapshot was taken, searches through it may reject with
+ * `SNAPSHOT_EXPIRED`.
+ */
+export declare class NativeSnapshot {
+
+}
+
+/** Creates an index for a storage-provider URI (strict-create semantics). */
 export declare function createIndex(uri: string, config: NativeIndexConfig): NativeIndex
+
+/**
+ * Destroys a named `memory:<name>` index: removes the registry entry so the
+ * name can be re-created and the retained storage is freed. The escape hatch
+ * for the registry's process-lifetime retention (named entries otherwise
+ * survive `close()` forever).
+ */
+export declare function destroyIndex(uri: string): void
 
 export interface NativeHit {
   id: bigint
@@ -36,8 +73,36 @@ export interface NativeItem {
   labels?: Array<number>
 }
 
+/**
+ * Partial per-query budget; unset fields keep the core defaults
+ * (`QueryBudget::default()`). Byte-sized caps are `f64` because they can
+ * exceed `u32`; the wrapper guarantees positive safe integers.
+ */
+export interface NativeQueryBudget {
+  maxVisited?: number
+  maxCandidates?: number
+  maxReadBatch?: number
+  maxRescore?: number
+  maxFullVectorBytes?: number
+  maxQueryBytes?: number
+}
+
 export interface NativeSearchOptions {
   limit: number
   searchListSize: number
   rescore?: boolean
+  filterLabels?: Array<number>
+  budget?: NativeQueryBudget
 }
+
+/**
+ * Opens an existing index (strict-open semantics; never creates). When a
+ * config is supplied it is asserted against the stored manifest config.
+ */
+export declare function openIndex(uri: string, config?: NativeIndexConfig | undefined | null): NativeIndex
+
+/**
+ * Opens the index when it exists (asserting the supplied config against the
+ * stored manifest config), otherwise creates it.
+ */
+export declare function openOrCreateIndex(uri: string, config: NativeIndexConfig): NativeIndex

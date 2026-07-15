@@ -588,4 +588,8 @@ if (!nativeBinding) {
 
 module.exports = nativeBinding
 module.exports.NativeIndex = nativeBinding.NativeIndex
+module.exports.NativeSnapshot = nativeBinding.NativeSnapshot
 module.exports.createIndex = nativeBinding.createIndex
+module.exports.destroyIndex = nativeBinding.destroyIndex
+module.exports.openIndex = nativeBinding.openIndex
+module.exports.openOrCreateIndex = nativeBinding.openOrCreateIndex

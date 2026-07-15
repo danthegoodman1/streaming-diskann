@@ -80,8 +80,13 @@ test('delete removes the row from search results', async () => {
 })
 
 test('unsupported URI schemes reject and name the supported schemes', async () => {
+  // file: is planned (Phase 3), so it gets dedicated "not yet supported"
+  // phrasing rather than the generic unknown-scheme error.
   await expect(Index.create('file:./somewhere', CONFIG)).rejects.toThrow(
-    /unsupported URI scheme 'file:'.*supported schemes are 'memory:'/
+    /the 'file:' scheme is not yet supported.*supported schemes are 'memory:'/
+  )
+  await expect(Index.create('s3://bucket/index', CONFIG)).rejects.toThrow(
+    /unsupported URI scheme 's3:'.*supported schemes are 'memory:'/
   )
   await expect(Index.create('not-a-uri', CONFIG)).rejects.toThrow(
     /invalid index URI 'not-a-uri'.*supported schemes are 'memory:'/
@@ -180,6 +185,33 @@ test('delete by external id works for every bulkBuild row', async () => {
   await index.delete(ids.at(-1)!)
 
   await index.close()
+})
+
+test('bulkBuild accepts sync and async iterables (materialized before building)', async () => {
+  function* rows() {
+    for (const item of FIXTURE) yield item
+  }
+  const fromSync = await Index.create('memory:', CONFIG)
+  await fromSync.bulkBuild(rows())
+  const syncHits = await fromSync.search(vec(0.9, 0.1, 0), { limit: 1, searchListSize: 8 })
+  expect(syncHits[0].id).toBe(1002n)
+  await fromSync.close()
+
+  async function* asyncRows() {
+    for (const item of FIXTURE) {
+      await Promise.resolve()
+      yield item
+    }
+  }
+  const fromAsync = await Index.create('memory:', CONFIG)
+  await fromAsync.bulkBuild(asyncRows())
+  const asyncHits = await fromAsync.search(vec(0.9, 0.1, 0), { limit: 1, searchListSize: 8 })
+  expect(asyncHits[0].id).toBe(1002n)
+  await fromAsync.close()
+
+  const invalid = await Index.create('memory:', CONFIG)
+  await expect(invalid.bulkBuild({} as never)).rejects.toThrow(TypeError)
+  await invalid.close()
 })
 
 test('bulkBuild rejects duplicate external ids in the input', async () => {
