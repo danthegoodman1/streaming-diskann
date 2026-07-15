@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::mem::size_of;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::distance::{distance_xor_optimized, preprocess_cosine, DistanceMetric};
 use crate::labels::{Label, LabelSetView};
@@ -18,8 +18,8 @@ use crate::storage::{
     checked_add, checked_mul, checked_sum, full_vector_read_batch_estimated_bytes,
     routing_node_record_estimated_bytes, FullVectorRead, FullVectorReader, HotDeltaStore,
     ImmutableSegmentStore, ManifestSnapshot, MemoryStorage, MetadataStore, MutationLog,
-    MutationLogEntry, MutationLogOffset, NodeRead, NodeReader, QuantizerScope, QuantizerStore,
-    RoutingNodeRecord, SerializedMutation, StoredQuantizer, TombstoneEpoch,
+    MutationLogEntry, MutationLogOffset, NodeRead, NodeReader, QuantizerReference, QuantizerScope,
+    QuantizerStore, RoutingNodeRecord, SerializedMutation, StoredQuantizer, TombstoneEpoch,
 };
 use crate::{
     Error, ExternalId, IndexConfig, LabelSet, NodeId, NodeRecord, QuantizerConfig, QueryBudget,
@@ -93,6 +93,11 @@ pub struct StreamingDiskAnnIndex<S> {
     storage: S,
     config: IndexConfig,
     next_node_id: Mutex<u64>,
+    /// Single-entry cache of the loaded SBQ model keyed by the manifest's
+    /// quantizer reference. Search and insert reuse the cached model until a
+    /// snapshot carries a different reference (newer version or scope), at
+    /// which point the next load replaces the entry.
+    quantizer_cache: Mutex<Option<(QuantizerReference, Arc<SbqQuantizer>)>>,
 }
 
 impl StreamingDiskAnnIndex<MemoryStorage> {
@@ -144,6 +149,7 @@ impl<S: MetadataStore + NodeReader> StreamingDiskAnnIndex<S> {
             storage,
             config: snapshot.config.clone(),
             next_node_id: Mutex::new(next_node_id),
+            quantizer_cache: Mutex::new(None),
         })
     }
 
@@ -165,6 +171,7 @@ impl<S: MetadataStore + NodeReader> StreamingDiskAnnIndex<S> {
             storage,
             config,
             next_node_id: Mutex::new(next_node_id),
+            quantizer_cache: Mutex::new(None),
         })
     }
 }
@@ -290,26 +297,27 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
         }
 
         let routing_query = self.routing_query_for_snapshot(snapshot, query)?;
-        let memory =
+        let mut memory =
             QueryMemoryAccountant::new(&snapshot.config, query, &routing_query, &options.budget)?;
         let mut heap = BinaryHeap::new();
         let mut seen = BTreeSet::new();
         let mut visited = BTreeSet::new();
         let mut candidates = Vec::new();
-        memory.check_graph_state(heap.len(), seen.len(), visited.len(), &candidates)?;
+        // Per-query cache of fetched-but-unvisited routing records. Every node
+        // pushed to the heap was fetched exactly once (in a start or neighbor
+        // batch) and its record is parked in the slot carried by the heap
+        // entry; popping takes the record from its slot instead of issuing a
+        // batch-of-1 re-read. Consumed slots release their record bytes from
+        // the memory accountant.
+        let mut fetched: Vec<Option<RoutingNodeRecord>> = Vec::new();
+        memory.check_graph_state(heap.len(), seen.len(), visited.len())?;
 
         let start_records = self.read_present_records(
             snapshot,
             &start_node_ids(snapshot, options.filter.as_ref()),
             &options.budget,
         )?;
-        memory.check_with_routing_records(
-            heap.len(),
-            seen.len(),
-            visited.len(),
-            &candidates,
-            &start_records,
-        )?;
+        memory.check_with_routing_records(heap.len(), seen.len(), visited.len(), &start_records)?;
         for record in start_records {
             if seen.insert(record.id) {
                 ensure_candidate_budget(seen.len(), options.budget.max_candidates)?;
@@ -318,8 +326,10 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
                     &routing_query,
                     &record.routing_vector,
                 )?;
-                heap.push(Reverse(QueuedNode::new(record.id, distance)));
-                memory.check_graph_state(heap.len(), seen.len(), visited.len(), &candidates)?;
+                heap.push(Reverse(QueuedNode::new(record.id, distance, fetched.len())));
+                memory.record_cached(&record)?;
+                fetched.push(Some(record));
+                memory.check_graph_state(heap.len(), seen.len(), visited.len())?;
             }
         }
 
@@ -332,25 +342,21 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
             }
             ensure_visited_budget(visited.len() + 1, options.budget.max_visited)?;
             visited.insert(candidate.node_id);
-            memory.check_graph_state(heap.len(), seen.len(), visited.len(), &candidates)?;
+            memory.check_graph_state(heap.len(), seen.len(), visited.len())?;
 
-            let record_reads =
-                self.read_present_records(snapshot, &[candidate.node_id], &options.budget)?;
-            memory.check_with_routing_records(
-                heap.len(),
-                seen.len(),
-                visited.len(),
-                &candidates,
-                &record_reads,
-            )?;
-            let Some(record) = record_reads.into_iter().next() else {
+            // The record was fetched when this node was discovered; take it
+            // from the per-query cache instead of re-reading storage.
+            // Invariant: each present node is pushed to the heap exactly once
+            // with a unique slot, and its slot is taken exactly once here.
+            let record = fetched.get_mut(candidate.slot).and_then(Option::take);
+            debug_assert!(
+                record.is_some(),
+                "slot cache invariant broken: popped candidate has empty slot"
+            );
+            let Some(record) = record else {
                 continue;
             };
-            candidates.push(RoutingCandidate {
-                record: record.clone(),
-                routing_distance: candidate.distance,
-            });
-            memory.check_graph_state(heap.len(), seen.len(), visited.len(), &candidates)?;
+            memory.release_cached(&record)?;
 
             let mut to_read = Vec::new();
             for neighbor in &record.neighbors {
@@ -360,13 +366,13 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
                     to_read.push(*neighbor);
                 }
             }
-            memory.check_with_node_ids(
-                heap.len(),
-                seen.len(),
-                visited.len(),
-                &candidates,
-                to_read.len(),
-            )?;
+            memory.record_candidate(&record)?;
+            candidates.push(RoutingCandidate {
+                record,
+                routing_distance: candidate.distance,
+            });
+            memory.check_graph_state(heap.len(), seen.len(), visited.len())?;
+            memory.check_with_node_ids(heap.len(), seen.len(), visited.len(), to_read.len())?;
 
             let neighbor_records =
                 self.read_present_records(snapshot, &to_read, &options.budget)?;
@@ -374,7 +380,6 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
                 heap.len(),
                 seen.len(),
                 visited.len(),
-                &candidates,
                 &neighbor_records,
             )?;
             for neighbor in neighbor_records {
@@ -383,8 +388,14 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
                     &routing_query,
                     &neighbor.routing_vector,
                 )?;
-                heap.push(Reverse(QueuedNode::new(neighbor.id, distance)));
-                memory.check_graph_state(heap.len(), seen.len(), visited.len(), &candidates)?;
+                heap.push(Reverse(QueuedNode::new(
+                    neighbor.id,
+                    distance,
+                    fetched.len(),
+                )));
+                memory.record_cached(&neighbor)?;
+                fetched.push(Some(neighbor));
+                memory.check_graph_state(heap.len(), seen.len(), visited.len())?;
             }
         }
 
@@ -400,11 +411,14 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
                 options.budget.max_rescore
             )));
         }
-        memory.check_graph_state(heap.len(), seen.len(), visited.len(), &candidates)?;
+        memory.rebuild_candidates(&candidates)?;
+        memory.check_graph_state(heap.len(), seen.len(), visited.len())?;
         drop(heap);
         drop(seen);
         drop(visited);
-        memory.check_candidates_only(&candidates)?;
+        memory.release_all_cached();
+        drop(fetched);
+        memory.check_candidates_only()?;
 
         let mut hits = if options.rescore {
             self.rescore_candidates(snapshot, query, &candidates, &options.budget, &memory)?
@@ -717,7 +731,7 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
         }
     }
 
-    fn load_snapshot_quantizer(&self, snapshot: &ManifestSnapshot) -> Result<SbqQuantizer> {
+    fn load_snapshot_quantizer(&self, snapshot: &ManifestSnapshot) -> Result<Arc<SbqQuantizer>> {
         let reference = snapshot
             .quantizers
             .iter()
@@ -728,9 +742,23 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
                     "SBQ snapshot does not contain an index quantizer".to_string(),
                 )
             })?;
-        match self.storage.load_quantizer(reference)? {
-            StoredQuantizer::Sbq { config, stats } => SbqQuantizer::from_stats(config, stats),
+
+        let mut cache = self
+            .quantizer_cache
+            .lock()
+            .map_err(|_| Error::Storage("quantizer cache mutex was poisoned".to_string()))?;
+        if let Some((cached_reference, quantizer)) = cache.as_ref() {
+            if cached_reference == reference {
+                return Ok(Arc::clone(quantizer));
+            }
         }
+        let quantizer = match self.storage.load_quantizer(reference)? {
+            StoredQuantizer::Sbq { config, stats } => {
+                Arc::new(SbqQuantizer::from_stats(config, stats)?)
+            }
+        };
+        *cache = Some((*reference, Arc::clone(&quantizer)));
+        Ok(quantizer)
     }
 
     fn read_present_record(
@@ -817,7 +845,7 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
                     chunk.len()
                 )));
             }
-            memory.check_rescore_batch(candidates, hits.len(), &reads)?;
+            memory.check_rescore_batch(hits.len(), &reads)?;
             for read in reads {
                 let candidate = &candidates[candidate_offset];
                 candidate_offset += 1;
@@ -828,7 +856,7 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
                         candidate.record.external_id,
                         snapshot.config.distance.distance(query, &vector),
                     )?);
-                    memory.check_rescore_hits(candidates, hits.len())?;
+                    memory.check_rescore_hits(hits.len())?;
                 }
             }
         }
@@ -1095,12 +1123,20 @@ struct RoutingCandidate {
 struct QueuedNode {
     node_id: NodeId,
     distance: f32,
+    /// Index of this node's fetched record in the per-query record cache.
+    /// Not part of the ordering; each node is pushed exactly once, so the
+    /// slot is a plain payload.
+    slot: usize,
 }
 
 impl QueuedNode {
-    fn new(node_id: NodeId, distance: f32) -> Self {
+    fn new(node_id: NodeId, distance: f32, slot: usize) -> Self {
         debug_assert!(distance.is_finite());
-        Self { node_id, distance }
+        Self {
+            node_id,
+            distance,
+            slot,
+        }
     }
 }
 
@@ -1130,10 +1166,26 @@ enum RoutingQuery {
     Sbq(Vec<crate::sbq::SbqVectorElement>),
 }
 
+/// Per-query byte accountant with incremental running totals.
+///
+/// Candidate-record and cached-record byte totals are updated as records are
+/// appended/consumed, so each budget check is O(1) instead of re-walking every
+/// accumulated candidate (previously O(candidates) per check, O(candidates^2)
+/// per query). The per-component byte-estimation formulas are unchanged.
 #[derive(Debug, Clone)]
 struct QueryMemoryAccountant<'a> {
     budget: &'a QueryBudget,
     base_query_bytes: usize,
+    /// Number of accumulated `RoutingCandidate`s.
+    candidate_count: usize,
+    /// Sum of `routing_node_record_estimated_bytes` over accumulated candidates.
+    candidate_record_bytes: usize,
+    /// Number of slots ever allocated in the per-query record cache. Slots
+    /// are not reclaimed when a record is consumed (only the record payload
+    /// is), matching the cache's `Vec<Option<_>>` representation.
+    cached_slots: usize,
+    /// Sum of `routing_node_record_estimated_bytes` over live cached records.
+    cached_record_bytes: usize,
 }
 
 impl<'a> QueryMemoryAccountant<'a> {
@@ -1149,6 +1201,10 @@ impl<'a> QueryMemoryAccountant<'a> {
         let accountant = Self {
             budget,
             base_query_bytes,
+            candidate_count: 0,
+            candidate_record_bytes: 0,
+            cached_slots: 0,
+            cached_record_bytes: 0,
         };
         accountant.check_bytes("query vectors", base_query_bytes)?;
 
@@ -1160,16 +1216,64 @@ impl<'a> QueryMemoryAccountant<'a> {
         Ok(accountant)
     }
 
+    /// Accounts for one record appended to the accumulated candidate list.
+    fn record_candidate(&mut self, record: &RoutingNodeRecord) -> Result<()> {
+        self.candidate_count = checked_add(self.candidate_count, 1)?;
+        self.candidate_record_bytes = checked_add(
+            self.candidate_record_bytes,
+            routing_node_record_estimated_bytes(record)?,
+        )?;
+        Ok(())
+    }
+
+    /// Recomputes candidate totals after the candidate list was filtered.
+    fn rebuild_candidates(&mut self, candidates: &[RoutingCandidate]) -> Result<()> {
+        self.candidate_count = candidates.len();
+        let mut bytes = 0_usize;
+        for candidate in candidates {
+            bytes = checked_add(
+                bytes,
+                routing_node_record_estimated_bytes(&candidate.record)?,
+            )?;
+        }
+        self.candidate_record_bytes = bytes;
+        Ok(())
+    }
+
+    /// Accounts for one record parked in a new per-query cache slot.
+    fn record_cached(&mut self, record: &RoutingNodeRecord) -> Result<()> {
+        self.cached_slots = checked_add(self.cached_slots, 1)?;
+        self.cached_record_bytes = checked_add(
+            self.cached_record_bytes,
+            routing_node_record_estimated_bytes(record)?,
+        )?;
+        Ok(())
+    }
+
+    /// Releases one record taken out of the per-query record cache. The slot
+    /// cell itself stays allocated until the cache is dropped.
+    fn release_cached(&mut self, record: &RoutingNodeRecord) -> Result<()> {
+        self.cached_record_bytes = self
+            .cached_record_bytes
+            .saturating_sub(routing_node_record_estimated_bytes(record)?);
+        Ok(())
+    }
+
+    /// Releases all remaining cached records when the cache is dropped.
+    fn release_all_cached(&mut self) {
+        self.cached_slots = 0;
+        self.cached_record_bytes = 0;
+    }
+
     fn check_graph_state(
         &self,
         heap_len: usize,
         seen_len: usize,
         visited_len: usize,
-        candidates: &[RoutingCandidate],
     ) -> Result<()> {
         self.check_bytes(
             "query graph state",
-            self.graph_state_bytes(heap_len, seen_len, visited_len, candidates, 0)?,
+            self.graph_state_bytes(heap_len, seen_len, visited_len, 0)?,
         )
     }
 
@@ -1178,7 +1282,6 @@ impl<'a> QueryMemoryAccountant<'a> {
         heap_len: usize,
         seen_len: usize,
         visited_len: usize,
-        candidates: &[RoutingCandidate],
         node_id_count: usize,
     ) -> Result<()> {
         let transient_bytes = checked_sum([
@@ -1187,7 +1290,7 @@ impl<'a> QueryMemoryAccountant<'a> {
         ])?;
         self.check_bytes(
             "query node-id batch",
-            self.graph_state_bytes(heap_len, seen_len, visited_len, candidates, transient_bytes)?,
+            self.graph_state_bytes(heap_len, seen_len, visited_len, transient_bytes)?,
         )
     }
 
@@ -1196,52 +1299,62 @@ impl<'a> QueryMemoryAccountant<'a> {
         heap_len: usize,
         seen_len: usize,
         visited_len: usize,
-        candidates: &[RoutingCandidate],
         records: &[RoutingNodeRecord],
     ) -> Result<()> {
         let transient_bytes = routing_record_batch_estimated_bytes(records)?;
         self.check_bytes(
             "query routing read batch",
-            self.graph_state_bytes(heap_len, seen_len, visited_len, candidates, transient_bytes)?,
+            self.graph_state_bytes(heap_len, seen_len, visited_len, transient_bytes)?,
         )
     }
 
-    fn check_candidates_only(&self, candidates: &[RoutingCandidate]) -> Result<()> {
+    fn check_candidates_only(&self) -> Result<()> {
         self.check_bytes(
             "query candidate records",
-            checked_sum([
-                self.base_query_bytes,
-                candidate_records_estimated_bytes(candidates)?,
-            ])?,
+            checked_sum([self.base_query_bytes, self.candidates_estimated_bytes()?])?,
         )
     }
 
-    fn check_rescore_batch(
-        &self,
-        candidates: &[RoutingCandidate],
-        hit_count: usize,
-        reads: &[FullVectorRead],
-    ) -> Result<()> {
+    fn check_rescore_batch(&self, hit_count: usize, reads: &[FullVectorRead]) -> Result<()> {
         self.check_bytes(
             "query rescore batch",
             checked_sum([
                 self.base_query_bytes,
-                candidate_records_estimated_bytes(candidates)?,
+                self.candidates_estimated_bytes()?,
                 search_hits_estimated_bytes(hit_count)?,
                 full_vector_read_batch_estimated_bytes(reads)?,
             ])?,
         )
     }
 
-    fn check_rescore_hits(&self, candidates: &[RoutingCandidate], hit_count: usize) -> Result<()> {
+    fn check_rescore_hits(&self, hit_count: usize) -> Result<()> {
         self.check_bytes(
             "query rescore hits",
             checked_sum([
                 self.base_query_bytes,
-                candidate_records_estimated_bytes(candidates)?,
+                self.candidates_estimated_bytes()?,
                 search_hits_estimated_bytes(hit_count)?,
             ])?,
         )
+    }
+
+    /// Same formula as the previous `candidate_records_estimated_bytes` walk,
+    /// computed in O(1) from the running totals.
+    fn candidates_estimated_bytes(&self) -> Result<usize> {
+        checked_sum([
+            size_of::<Vec<RoutingCandidate>>(),
+            checked_mul(self.candidate_count, size_of::<RoutingCandidate>())?,
+            self.candidate_record_bytes,
+        ])
+    }
+
+    /// Estimated bytes held by the per-query fetched-record cache.
+    fn cached_records_estimated_bytes(&self) -> Result<usize> {
+        checked_sum([
+            size_of::<Vec<Option<RoutingNodeRecord>>>(),
+            checked_mul(self.cached_slots, size_of::<Option<RoutingNodeRecord>>())?,
+            self.cached_record_bytes,
+        ])
     }
 
     fn graph_state_bytes(
@@ -1249,7 +1362,6 @@ impl<'a> QueryMemoryAccountant<'a> {
         heap_len: usize,
         seen_len: usize,
         visited_len: usize,
-        candidates: &[RoutingCandidate],
         transient_bytes: usize,
     ) -> Result<usize> {
         checked_sum([
@@ -1257,7 +1369,8 @@ impl<'a> QueryMemoryAccountant<'a> {
             heap_estimated_bytes(heap_len)?,
             node_set_estimated_bytes(seen_len)?,
             node_set_estimated_bytes(visited_len)?,
-            candidate_records_estimated_bytes(candidates)?,
+            self.candidates_estimated_bytes()?,
+            self.cached_records_estimated_bytes()?,
             transient_bytes,
         ])
     }
@@ -1643,20 +1756,6 @@ fn node_set_estimated_bytes(len: usize) -> Result<usize> {
     ])
 }
 
-fn candidate_records_estimated_bytes(candidates: &[RoutingCandidate]) -> Result<usize> {
-    let mut total = checked_sum([
-        size_of::<Vec<RoutingCandidate>>(),
-        checked_mul(candidates.len(), size_of::<RoutingCandidate>())?,
-    ])?;
-    for candidate in candidates {
-        total = checked_add(
-            total,
-            routing_node_record_estimated_bytes(&candidate.record)?,
-        )?;
-    }
-    Ok(total)
-}
-
 fn routing_record_batch_estimated_bytes(records: &[RoutingNodeRecord]) -> Result<usize> {
     let mut total = checked_sum([
         size_of::<Vec<RoutingNodeRecord>>(),
@@ -1764,7 +1863,213 @@ fn ensure_neighbor(neighbors: &mut Vec<NodeId>, node_id: NodeId, max_neighbors: 
 mod tests {
     use super::*;
     use crate::distance::DistanceMetric;
-    use crate::storage::NodeReader;
+    use crate::storage::{
+        ImmutableSegment, ManifestVersion, MutableNodeStore, NodeReader, PublishedHotDelta,
+        QuantizerReference,
+    };
+
+    /// Test-only storage middleware that counts node-read resolutions and
+    /// quantizer loads while delegating everything to [`MemoryStorage`].
+    #[derive(Debug)]
+    struct CountingStorage {
+        inner: MemoryStorage,
+        state: Mutex<CountingState>,
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingState {
+        node_read_calls: usize,
+        node_resolutions: usize,
+        /// Batch-of-1 `read_nodes` calls for a node that was already resolved.
+        single_node_rereads: usize,
+        node_read_counts: BTreeMap<NodeId, usize>,
+        load_quantizer_calls: usize,
+    }
+
+    impl CountingStorage {
+        fn new(inner: MemoryStorage) -> Self {
+            Self {
+                inner,
+                state: Mutex::new(CountingState::default()),
+            }
+        }
+
+        fn lock_state(&self) -> std::sync::MutexGuard<'_, CountingState> {
+            self.state.lock().expect("counting storage mutex poisoned")
+        }
+
+        fn reset_counts(&self) {
+            *self.lock_state() = CountingState::default();
+        }
+
+        fn node_read_calls(&self) -> usize {
+            self.lock_state().node_read_calls
+        }
+
+        fn node_resolutions(&self) -> usize {
+            self.lock_state().node_resolutions
+        }
+
+        fn single_node_rereads(&self) -> usize {
+            self.lock_state().single_node_rereads
+        }
+
+        fn max_reads_per_node(&self) -> usize {
+            self.lock_state()
+                .node_read_counts
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(0)
+        }
+
+        fn distinct_nodes_read(&self) -> usize {
+            self.lock_state().node_read_counts.len()
+        }
+
+        fn load_quantizer_calls(&self) -> usize {
+            self.lock_state().load_quantizer_calls
+        }
+    }
+
+    impl MetadataStore for CountingStorage {
+        fn load_snapshot(&self) -> Result<ManifestSnapshot> {
+            self.inner.load_snapshot()
+        }
+
+        fn compare_and_publish(
+            &self,
+            expected_version: ManifestVersion,
+            replacement: ManifestSnapshot,
+        ) -> Result<ManifestSnapshot> {
+            self.inner
+                .compare_and_publish(expected_version, replacement)
+        }
+    }
+
+    impl NodeReader for CountingStorage {
+        fn read_nodes(
+            &self,
+            snapshot: &ManifestSnapshot,
+            node_ids: &[NodeId],
+            budget: &QueryBudget,
+        ) -> Result<Vec<NodeRead>> {
+            {
+                let mut state = self.lock_state();
+                state.node_read_calls += 1;
+                state.node_resolutions += node_ids.len();
+                for node_id in node_ids {
+                    let previous = state.node_read_counts.get(node_id).copied().unwrap_or(0);
+                    if node_ids.len() == 1 && previous > 0 {
+                        state.single_node_rereads += 1;
+                    }
+                    state.node_read_counts.insert(*node_id, previous + 1);
+                }
+            }
+            self.inner.read_nodes(snapshot, node_ids, budget)
+        }
+    }
+
+    impl FullVectorReader for CountingStorage {
+        fn read_full_vectors(
+            &self,
+            snapshot: &ManifestSnapshot,
+            node_ids: &[NodeId],
+            budget: &QueryBudget,
+        ) -> Result<Vec<FullVectorRead>> {
+            self.inner.read_full_vectors(snapshot, node_ids, budget)
+        }
+    }
+
+    impl QuantizerStore for CountingStorage {
+        fn store_quantizer(
+            &self,
+            scope: QuantizerScope,
+            quantizer: StoredQuantizer,
+        ) -> Result<QuantizerReference> {
+            self.inner.store_quantizer(scope, quantizer)
+        }
+
+        fn load_quantizer(&self, reference: &QuantizerReference) -> Result<StoredQuantizer> {
+            self.lock_state().load_quantizer_calls += 1;
+            self.inner.load_quantizer(reference)
+        }
+    }
+
+    impl MutableNodeStore for CountingStorage {
+        fn append_node(&self, record: NodeRecord, config: &IndexConfig) -> Result<()> {
+            self.inner.append_node(record, config)
+        }
+
+        fn rewrite_neighbors(
+            &self,
+            node_id: NodeId,
+            neighbors: Vec<NodeId>,
+            config: &IndexConfig,
+        ) -> Result<()> {
+            self.inner.rewrite_neighbors(node_id, neighbors, config)
+        }
+
+        fn tombstone_node(&self, node_id: NodeId) -> Result<TombstoneEpoch> {
+            self.inner.tombstone_node(node_id)
+        }
+
+        fn update_start_nodes(&self, start_nodes: crate::graph::StartNodes) -> Result<()> {
+            self.inner.update_start_nodes(start_nodes)
+        }
+    }
+
+    impl HotDeltaStore for CountingStorage {
+        fn publish_hot_delta(&self) -> Result<PublishedHotDelta> {
+            self.inner.publish_hot_delta()
+        }
+    }
+
+    impl MutationLog for CountingStorage {
+        fn append_mutation(&self, mutation: SerializedMutation) -> Result<MutationLogOffset> {
+            self.inner.append_mutation(mutation)
+        }
+
+        fn replay_from(
+            &self,
+            offset: MutationLogOffset,
+            replay: &mut dyn FnMut(&MutationLogEntry) -> Result<()>,
+        ) -> Result<()> {
+            self.inner.replay_from(offset, replay)
+        }
+
+        fn checkpoint(&self, offset: MutationLogOffset) -> Result<()> {
+            self.inner.checkpoint(offset)
+        }
+
+        fn checkpoint_offset(&self) -> Result<MutationLogOffset> {
+            self.inner.checkpoint_offset()
+        }
+
+        fn truncate_before_checkpoint(&self) -> Result<()> {
+            self.inner.truncate_before_checkpoint()
+        }
+    }
+
+    impl ImmutableSegmentStore for CountingStorage {
+        fn insert_immutable_segment<I>(
+            &self,
+            records: I,
+            config: &IndexConfig,
+        ) -> Result<ImmutableSegment>
+        where
+            I: IntoIterator<Item = NodeRecord>,
+        {
+            ImmutableSegmentStore::insert_immutable_segment(&self.inner, records, config)
+        }
+    }
+
+    fn counting_index(config: IndexConfig) -> StreamingDiskAnnIndex<CountingStorage> {
+        let storage = CountingStorage::new(
+            MemoryStorage::empty(config, crate::graph::StartNodes::new(EMPTY_START_NODE)).unwrap(),
+        );
+        StreamingDiskAnnIndex::from_storage(storage).unwrap()
+    }
 
     fn plain_config(dimensions: usize) -> IndexConfig {
         let mut config = IndexConfig::new(dimensions);
@@ -2402,6 +2707,96 @@ mod tests {
         // The insert publish upgrades the legacy manifest with the mark.
         let snapshot = reopened.snapshot().unwrap();
         assert_eq!(snapshot.max_assigned_node_id, Some(NodeId::new(4)));
+    }
+
+    #[test]
+    fn search_resolves_each_visited_node_at_most_once() {
+        let mut config = plain_config(2);
+        config.max_neighbors = 2;
+        config.build_search_list_size = 8;
+        let index = counting_index(config);
+        let vectors = (0..10)
+            .map(|idx| input(1200 + idx as u64, &[idx as f32, 0.0]))
+            .collect::<Vec<_>>();
+        index.bulk_build(vectors).unwrap();
+
+        index.storage().reset_counts();
+        let hits = index.search(&[3.0, 0.0], search_options(3, 8)).unwrap();
+        assert_eq!(hits.len(), 3);
+
+        // Pre-2A code re-read every popped candidate as a batch-of-1 even
+        // though the record was already fetched when it was discovered in a
+        // start/neighbor batch: one single-node re-read per visited node and
+        // per-node read counts of 2. With the per-query record cache each
+        // node is resolved from storage at most once per query.
+        assert_eq!(
+            index.storage().single_node_rereads(),
+            0,
+            "search must not re-read already-fetched records as batch-of-1"
+        );
+        assert_eq!(
+            index.storage().max_reads_per_node(),
+            1,
+            "each node must be resolved from storage at most once per query"
+        );
+        // Total resolutions are exactly the distinct discovered nodes
+        // (initial start reads + batched neighbor reads), with no extra
+        // per-visit reads on top.
+        assert_eq!(
+            index.storage().node_resolutions(),
+            index.storage().distinct_nodes_read()
+        );
+        assert!(index.storage().node_read_calls() > 0);
+    }
+
+    #[test]
+    fn quantizer_cache_reloads_only_on_new_reference() {
+        let mut config = plain_config(3);
+        config.quantizer = QuantizerConfig::Sbq {
+            bits_per_dimension: 1,
+            use_mean: true,
+        };
+        let index = counting_index(config);
+        let vectors = vec![
+            input(1301, &[-1.0, -1.0, 0.0]),
+            input(1302, &[1.0, 1.0, 1.0]),
+            input(1303, &[2.0, 2.0, 2.0]),
+        ];
+        index.bulk_build(vectors.clone()).unwrap();
+
+        index.storage().reset_counts();
+        index
+            .search(&[1.0, 1.0, 1.0], search_options(2, 3))
+            .unwrap();
+        assert_eq!(
+            index.storage().load_quantizer_calls(),
+            1,
+            "first search must load the quantizer exactly once"
+        );
+        index
+            .search(&[1.0, 1.0, 1.0], search_options(2, 3))
+            .unwrap();
+        assert_eq!(
+            index.storage().load_quantizer_calls(),
+            1,
+            "second search must issue zero quantizer loads"
+        );
+
+        // A manifest carrying a NEW quantizer reference invalidates the cache:
+        // the next search reloads exactly once, then caching resumes.
+        index.bulk_build(vectors).unwrap();
+        index
+            .search(&[1.0, 1.0, 1.0], search_options(2, 3))
+            .unwrap();
+        assert_eq!(
+            index.storage().load_quantizer_calls(),
+            2,
+            "new quantizer reference must trigger exactly one reload"
+        );
+        index
+            .search(&[1.0, 1.0, 1.0], search_options(2, 3))
+            .unwrap();
+        assert_eq!(index.storage().load_quantizer_calls(), 2);
     }
 
     #[test]

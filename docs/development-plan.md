@@ -85,11 +85,11 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 2A: Record cache eliminates double reads | Missing: implementation in `search_with_snapshot` + read-count test. |
-| Incomplete | Work | 2B: Incremental memory accountant | Missing: running-total refactor of `QueryMemoryAccountant`. |
-| Incomplete | Work | 2C: Quantizer cache keyed by `QuantizerReference` | Missing: cache + invalidation-on-new-reference test. |
-| Incomplete | Test | 2D: Budget semantics preserved with cache | Missing: tight-budget test passing with cached records counted. |
-| Incomplete | Gate | Bench parity or better on search benches | Missing: recorded before/after `bench.rs` output. |
+| Complete | Work | 2A: Record cache eliminates double reads | `search_with_snapshot` parks each fetched record in a per-query `Vec<Option<RoutingNodeRecord>>` slot carried by its heap entry (`QueuedNode.slot`); pops take the record from the slot instead of re-reading a batch-of-1. Test `search_resolves_each_visited_node_at_most_once` (counting `NodeReader` wrapper `CountingStorage`) asserts zero single-node re-reads and max 1 read per node; on pre-change code it fails with 8 single-node re-reads (one per visited node, `search_list_size=8`) and per-node read counts of 2. |
+| Complete | Work | 2B: Incremental memory accountant | `QueryMemoryAccountant` keeps running totals (`candidate_count`/`candidate_record_bytes`, `cached_slots`/`cached_record_bytes`) updated on `record_candidate`/`record_cached`/`release_cached`; every `check_*` is now O(1) instead of re-walking all candidates (was O(candidates²) per query). Per-component byte formulas unchanged; one O(n) `rebuild_candidates` after the post-walk label `retain`. Cached records count in `graph_state_bytes` via `cached_records_estimated_bytes`. |
+| Complete | Work | 2C: Quantizer cache keyed by `QuantizerReference` | `StreamingDiskAnnIndex.quantizer_cache: Mutex<Option<(QuantizerReference, Arc<SbqQuantizer>)>>`; `load_snapshot_quantizer` returns the cached `Arc` when the snapshot's index-scoped reference matches, else loads and replaces the entry. Test `quantizer_cache_reloads_only_on_new_reference` (counting `QuantizerStore` wrapper): second search issues zero `load_quantizer` calls; a rebuild that publishes a new reference triggers exactly one reload (fails pre-change: 2 loads after 2 searches). |
+| Complete | Test | 2D: Budget semantics preserved with cache | All `search_enforces_*` tests (max_query_bytes, query_state_bytes, max_candidate_nodes, max_visited_nodes, max_rescore_count, max_full_vector_bytes) plus `search_succeeds_with_tight_budget_without_explicit_cache` pass unchanged; batched neighbor reads still go through `read_present_records` chunked to `max_read_batch`. `cargo test`: 81 unit + 6 conformance green; `cargo fmt --check` clean. |
+| Complete | Gate | Bench parity or better on search benches | `cargo run --release --example bench -- --iters 200`, same machine, before (commit 4826e20) vs after: `graph_walk_search_no_rescore` 195.1–195.6 µs/op → 179.2–187.5 µs/op; `end_to_end_search_with_rescore` 202.4–204.4 µs/op → 184.6–197.6 µs/op (~6–8% faster, no regression across 5 runs). |
 
 ## Phase 3: Bulk Build Scaling
 
