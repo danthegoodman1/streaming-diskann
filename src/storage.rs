@@ -400,6 +400,11 @@ pub trait MetadataStore {
 ///
 /// Implementors should return only the requested routing records and must not
 /// fetch full vectors on this path. Use [`FullVectorReader`] for exact rescoring.
+///
+/// Implementations must return exactly one [`NodeRead`] per requested ID, in
+/// request order (absent nodes as [`NodeRead::Missing`], tombstoned nodes as
+/// [`NodeRead::Tombstoned`]); the index's row-count guards rely on this
+/// contract.
 pub trait NodeReader {
     /// Reads routing records for `node_ids` under `snapshot`.
     ///

@@ -475,6 +475,14 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
     /// Search skips tombstoned nodes after the tombstone epoch is published.
     /// Physical cleanup, compaction, or object deletion is backend-specific and
     /// stays outside this method.
+    ///
+    /// Deleting a node that is not a start node never traverses the graph.
+    /// Deleting a start node triggers a batched, budget-bounded reachability
+    /// walk to re-elect start nodes. If that walk is truncated by the default
+    /// [`QueryBudget`], labeled start entries whose labels were not reached
+    /// keep their existing entry as long as it still points at a live node
+    /// other than the deleted one; entries that pointed at the deleted node
+    /// itself are always removed.
     pub fn delete(&self, node_id: NodeId) -> Result<()> {
         self.apply_delete(node_id, true)
     }
@@ -568,17 +576,10 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
 
     fn apply_delete(&self, node_id: NodeId, append_log: bool) -> Result<()> {
         let snapshot = self.storage.load_snapshot()?;
-        let replacement_starts = if snapshot.start_nodes.all_nodes().contains(&node_id) {
-            let records = self.collect_reachable_records(&snapshot, &QueryBudget::default())?;
-            Some(start_nodes_for_records(
-                records
-                    .iter()
-                    .filter(|record| record.id != node_id)
-                    .map(|record| (record.id, &record.labels)),
-            ))
-        } else {
-            None
-        };
+        // Start-node repair is the only delete-time traversal: deleting a
+        // non-start node returns `None` here without reading any node.
+        let replacement_starts =
+            self.repair_start_nodes_after_delete(&snapshot, node_id, &QueryBudget::default())?;
 
         if append_log {
             self.storage.append_mutation(SerializedMutation::new(
@@ -1181,39 +1182,120 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
         Ok(changed.then_some(start_nodes))
     }
 
+    /// Recomputes start nodes for the pending delete of `node_id`.
+    ///
+    /// Returns `None` when the node is not a start node, without reading any
+    /// node record: non-start deletes never traverse the graph. Otherwise the
+    /// reachable graph is walked (batched and budget-bounded) and the start
+    /// map is rebuilt from the live records, excluding the node being deleted.
+    ///
+    /// When the walk is truncated by `budget.max_visited` /
+    /// `budget.max_candidates`, a label whose nodes were never reached would
+    /// otherwise silently lose its start entry. In that case the previous
+    /// labeled entry is kept as long as it still points at a present node
+    /// other than `node_id` (verified with one batched read of the held-over
+    /// entries). Entries that pointed at the deleted node itself are dropped
+    /// even when the truncated walk found no replacement.
+    fn repair_start_nodes_after_delete(
+        &self,
+        snapshot: &ManifestSnapshot,
+        node_id: NodeId,
+        budget: &QueryBudget,
+    ) -> Result<Option<crate::graph::StartNodes>> {
+        if !snapshot.start_nodes.all_nodes().contains(&node_id) {
+            return Ok(None);
+        }
+
+        let reachable = self.collect_reachable_records(snapshot, budget)?;
+        let mut start_nodes = start_nodes_for_records(
+            reachable
+                .records
+                .iter()
+                .filter(|record| record.id != node_id)
+                .map(|record| (record.id, &record.labels)),
+        );
+
+        if reachable.truncated {
+            let holdovers: Vec<(Label, NodeId)> = snapshot
+                .start_nodes
+                .all_labeled_nodes()
+                .into_iter()
+                .filter_map(|(label, start)| label.map(|label| (label, start)))
+                .filter(|(label, start)| *start != node_id && !start_nodes.contains(*label))
+                .collect();
+            let mut candidate_ids: Vec<NodeId> =
+                holdovers.iter().map(|(_, start)| *start).collect();
+            candidate_ids.sort_unstable();
+            candidate_ids.dedup();
+            let live: BTreeSet<NodeId> = self
+                .read_present_records(snapshot, &candidate_ids, budget)?
+                .into_iter()
+                .map(|record| record.id)
+                .collect();
+            for (label, start) in holdovers {
+                if live.contains(&start) {
+                    start_nodes.upsert(label, start);
+                }
+            }
+        }
+
+        Ok(Some(start_nodes))
+    }
+
+    /// Walks the graph breadth-first from the start nodes, reading each
+    /// frontier in batches of `budget.max_read_batch`.
+    ///
+    /// Maintenance-only traversal for start-node repair; query search uses the
+    /// bounded heap walk in `search_with_snapshot`. At most
+    /// `budget.max_visited` nodes are visited and at most
+    /// `budget.max_candidates` are ever queued; when either cap stops the walk
+    /// before the frontier is exhausted the result is marked truncated,
+    /// meaning reachable nodes may be missing from `records`. Visit order is
+    /// the same deterministic FIFO order as a node-at-a-time BFS; batching
+    /// only changes how many storage reads deliver it.
     fn collect_reachable_records(
         &self,
         snapshot: &ManifestSnapshot,
         budget: &QueryBudget,
-    ) -> Result<Vec<RoutingNodeRecord>> {
-        // Maintenance-only traversal for start-node repair and reopen bookkeeping.
-        // Query search uses the bounded heap walk in `search_with_snapshot`.
-        let mut queue: VecDeque<_> = snapshot.start_nodes.all_nodes().into();
-        let mut queued: BTreeSet<_> = queue.iter().copied().collect();
-        let mut visited = BTreeSet::new();
+    ) -> Result<ReachableRecords> {
+        let mut queue = VecDeque::new();
+        let mut queued = BTreeSet::new();
+        for node_id in snapshot.start_nodes.all_nodes() {
+            if queued.insert(node_id) {
+                queue.push_back(node_id);
+            }
+        }
+        let mut visited = 0_usize;
         let mut records = Vec::new();
+        let mut truncated = false;
 
-        while let Some(node_id) = queue.pop_front() {
-            if visited.len() >= budget.max_visited {
+        while !queue.is_empty() {
+            let remaining = budget.max_visited.saturating_sub(visited);
+            if remaining == 0 {
+                truncated = true;
                 break;
             }
-            if !visited.insert(node_id) {
-                continue;
-            }
-            let Some(record) = self.read_present_record(snapshot, node_id, budget)? else {
-                continue;
-            };
-            for neighbor in &record.neighbors {
-                if queued.len() >= budget.max_candidates {
-                    break;
+            let take = queue.len().min(remaining);
+            let frontier: Vec<NodeId> = queue.drain(..take).collect();
+            visited += frontier.len();
+            // `read_present_records` splits the frontier into
+            // `budget.max_read_batch` chunks and keeps request order.
+            for record in self.read_present_records(snapshot, &frontier, budget)? {
+                for (offset, neighbor) in record.neighbors.iter().enumerate() {
+                    if queued.len() >= budget.max_candidates {
+                        truncated |= record.neighbors[offset..]
+                            .iter()
+                            .any(|neighbor| !queued.contains(neighbor));
+                        break;
+                    }
+                    if queued.insert(*neighbor) {
+                        queue.push_back(*neighbor);
+                    }
                 }
-                if queued.insert(*neighbor) {
-                    queue.push_back(*neighbor);
-                }
+                records.push(record);
             }
-            records.push(record);
         }
-        Ok(records)
+        Ok(ReachableRecords { records, truncated })
     }
 
     fn allocate_node_id(&self) -> Result<NodeId> {
@@ -1259,6 +1341,17 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
 struct RoutingCandidate {
     record: RoutingNodeRecord,
     routing_distance: f32,
+}
+
+/// Result of the bounded maintenance reachability walk.
+#[derive(Debug)]
+struct ReachableRecords {
+    /// Present records in deterministic BFS visit order.
+    records: Vec<RoutingNodeRecord>,
+    /// True when a budget cap (`max_visited` or `max_candidates`) stopped the
+    /// walk while unvisited frontier nodes remained, so reachable nodes may be
+    /// missing from `records`.
+    truncated: bool,
 }
 
 /// Borrowed candidate view consumed by the shared α-prune core.
@@ -1771,30 +1864,40 @@ fn next_node_id_from_snapshot<R: NodeReader>(
     }
 
     // Legacy fallback for manifests that predate `max_assigned_node_id`: walk
-    // the reachable graph and allocate above the largest ID found.
-    let mut queue: VecDeque<_> = snapshot
-        .start_nodes
-        .all_nodes()
-        .into_iter()
-        .filter(|node_id| *node_id != EMPTY_START_NODE)
-        .collect();
-    let mut queued: BTreeSet<_> = queue.iter().copied().collect();
-    let mut visited = BTreeSet::new();
-    let mut max_node_id = 0_u64;
+    // the reachable graph and allocate above the largest ID found. Each BFS
+    // frontier is read in `max_read_batch` chunks instead of one storage call
+    // per node; the visited set (and therefore the result) is unchanged.
     let budget = QueryBudget::default();
-
-    while let Some(node_id) = queue.pop_front() {
-        if !visited.insert(node_id) {
-            continue;
+    let chunk_size = budget.max_read_batch.max(1);
+    let mut queue = Vec::new();
+    let mut queued = BTreeSet::new();
+    for node_id in snapshot.start_nodes.all_nodes() {
+        if node_id != EMPTY_START_NODE && queued.insert(node_id) {
+            queue.push(node_id);
         }
-        max_node_id = max_node_id.max(node_id.get());
+    }
+    let mut max_node_id = 0_u64;
 
-        let reads = reader.read_nodes(snapshot, &[node_id], &budget)?;
-        if let Some(NodeRead::Present(record)) = reads.into_iter().next() {
-            max_node_id = max_node_id.max(record.id.get());
-            for neighbor in record.neighbors {
-                if queued.insert(neighbor) {
-                    queue.push_back(neighbor);
+    while !queue.is_empty() {
+        let frontier = std::mem::take(&mut queue);
+        for chunk in frontier.chunks(chunk_size) {
+            let reads = reader.read_nodes(snapshot, chunk, &budget)?;
+            if reads.len() != chunk.len() {
+                return Err(Error::Storage(format!(
+                    "node reader returned {} rows for {} requested nodes",
+                    reads.len(),
+                    chunk.len()
+                )));
+            }
+            for (node_id, read) in chunk.iter().zip(reads) {
+                max_node_id = max_node_id.max(node_id.get());
+                if let NodeRead::Present(record) = read {
+                    max_node_id = max_node_id.max(record.id.get());
+                    for neighbor in record.neighbors {
+                        if queued.insert(neighbor) {
+                            queue.push(neighbor);
+                        }
+                    }
                 }
             }
         }
@@ -2251,6 +2354,30 @@ mod tests {
 
     fn labeled_input(external_id: u64, vector: &[f32], labels: &[Label]) -> VectorInput {
         VectorInput::new(external_id, vector.to_vec(), LabelSet::from(labels))
+    }
+
+    /// LCG-derived vectors keep the built graph shape (and therefore the
+    /// read counts asserted by the maintenance-path tests) exactly
+    /// reproducible across runs.
+    fn deterministic_vectors(count: usize, dims: usize, base_external_id: u64) -> Vec<VectorInput> {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        (0..count)
+            .map(|idx| {
+                let full_vector = (0..dims)
+                    .map(|_| {
+                        state = state
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        (state >> 40) as f32 / (1_u64 << 24) as f32
+                    })
+                    .collect();
+                VectorInput::new(
+                    base_external_id + idx as u64,
+                    full_vector,
+                    LabelSet::default(),
+                )
+            })
+            .collect()
     }
 
     fn search_options(limit: usize, search_list_size: usize) -> SearchOptions {
@@ -2969,6 +3096,222 @@ mod tests {
         // The insert publish upgrades the legacy manifest with the mark.
         let snapshot = reopened.snapshot().unwrap();
         assert_eq!(snapshot.max_assigned_node_id, Some(NodeId::new(4)));
+    }
+
+    #[test]
+    fn from_storage_with_high_water_manifest_reads_zero_nodes() {
+        let mut config = plain_config(4);
+        config.max_neighbors = 8;
+        config.build_search_list_size = 16;
+        let index = counting_index(config);
+        index
+            .bulk_build(deterministic_vectors(20, 4, 1400))
+            .unwrap();
+
+        let storage = index.into_storage();
+        storage.reset_counts();
+        let reopened = StreamingDiskAnnIndex::from_storage(storage).unwrap();
+
+        // With `max_assigned_node_id` in the manifest, open is O(1): the
+        // snapshot load is pure metadata and the node-ID allocator
+        // short-circuits, so zero node records are read.
+        assert_eq!(reopened.storage().node_read_calls(), 0);
+        assert_eq!(reopened.storage().node_resolutions(), 0);
+
+        let inserted = reopened
+            .insert(1499_u64, vec![0.5, 0.5, 0.5, 0.5], LabelSet::default())
+            .unwrap();
+        assert_eq!(inserted, NodeId::new(21));
+    }
+
+    #[test]
+    fn legacy_manifest_reopen_batches_bfs_node_reads() {
+        let node_count = 520_usize;
+        let mut config = plain_config(4);
+        config.max_neighbors = 8;
+        config.build_search_list_size = 16;
+        let index = counting_index(config);
+        index
+            .bulk_build(deterministic_vectors(node_count, 4, 2000))
+            .unwrap();
+        let storage = index.into_storage();
+
+        // Simulate a manifest written before `max_assigned_node_id` existed.
+        let current = storage.load_snapshot().unwrap();
+        let mut legacy = current.clone();
+        legacy.max_assigned_node_id = None;
+        storage
+            .compare_and_publish(current.version, legacy)
+            .unwrap();
+
+        storage.reset_counts();
+        let reopened = StreamingDiskAnnIndex::from_storage(storage).unwrap();
+
+        // The fallback BFS still visits every reachable node exactly once...
+        assert_eq!(reopened.storage().distinct_nodes_read(), node_count);
+        assert_eq!(reopened.storage().node_resolutions(), node_count);
+        assert_eq!(reopened.storage().max_reads_per_node(), 1);
+        // ...but reads frontiers in `max_read_batch` chunks, so the number of
+        // storage calls is ~ceil(visited / max_read_batch) plus one partial
+        // chunk per BFS depth level, not one call per visited node.
+        let batch = QueryBudget::default().max_read_batch;
+        let max_calls = node_count.div_ceil(batch) + 8;
+        assert!(
+            reopened.storage().node_read_calls() <= max_calls,
+            "legacy BFS issued {} read_nodes calls for {} visited nodes (allowed {})",
+            reopened.storage().node_read_calls(),
+            node_count,
+            max_calls
+        );
+
+        let inserted = reopened
+            .insert(2999_u64, vec![0.5, 0.5, 0.5, 0.5], LabelSet::default())
+            .unwrap();
+        assert_eq!(inserted, NodeId::new(node_count as u64 + 1));
+    }
+
+    #[test]
+    fn delete_traverses_only_for_start_nodes_with_batched_reads() {
+        let node_count = 520_usize;
+        let mut config = plain_config(4);
+        config.max_neighbors = 8;
+        config.build_search_list_size = 16;
+        let index = counting_index(config);
+        index
+            .bulk_build(deterministic_vectors(node_count, 4, 3000))
+            .unwrap();
+
+        // Deleting a non-start node performs no graph traversal at all.
+        let snapshot = index.snapshot().unwrap();
+        let non_start = (1..=node_count as u64)
+            .map(NodeId::new)
+            .find(|id| !snapshot.start_nodes.all_nodes().contains(id))
+            .unwrap();
+        index.storage().reset_counts();
+        index.delete(non_start).unwrap();
+        assert_eq!(
+            index.storage().node_read_calls(),
+            0,
+            "non-start delete must not read any node records"
+        );
+
+        // Deleting a start node repairs start nodes with one batched BFS.
+        let snapshot = index.snapshot().unwrap();
+        let start = snapshot.start_nodes.default_node();
+        index.storage().reset_counts();
+        index.delete(start).unwrap();
+
+        let visited = index.storage().distinct_nodes_read();
+        assert!(
+            visited >= node_count - 8,
+            "repair BFS visited only {visited} of {node_count} nodes"
+        );
+        assert_eq!(index.storage().max_reads_per_node(), 1);
+        let batch = QueryBudget::default().max_read_batch;
+        let max_calls = visited.div_ceil(batch) + 8;
+        assert!(
+            index.storage().node_read_calls() <= max_calls,
+            "start-node repair issued {} read_nodes calls for {} visited nodes (allowed {})",
+            index.storage().node_read_calls(),
+            visited,
+            max_calls
+        );
+
+        // The repaired default start still resolves searches.
+        let replacement = index.snapshot().unwrap();
+        assert_ne!(replacement.start_nodes.default_node(), start);
+        let hits = index
+            .search(&[0.5, 0.5, 0.5, 0.5], search_options(3, 16))
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert!(!hits.iter().any(|hit| hit.node_id == start));
+    }
+
+    #[test]
+    fn deleting_labeled_start_node_keeps_valid_entries_for_remaining_labels() {
+        let mut config = plain_config(2);
+        config.has_labels = true;
+        let vectors = vec![
+            labeled_input(1601, &[0.0, 0.0], &[1]),
+            labeled_input(1602, &[1.0, 0.0], &[1]),
+            labeled_input(1603, &[10.0, 0.0], &[2]),
+            labeled_input(1604, &[11.0, 0.0], &[2]),
+        ];
+        let index = StreamingDiskAnnIndex::new_memory(config).unwrap();
+        index.bulk_build(vectors).unwrap();
+
+        let before = index.snapshot().unwrap();
+        assert_eq!(before.start_nodes.node_for_label(1), Some(NodeId::new(1)));
+        assert_eq!(before.start_nodes.node_for_label(2), Some(NodeId::new(3)));
+
+        // Node 1 is both the default start and label 1's start entry.
+        index.delete(NodeId::new(1)).unwrap();
+
+        let after = index.snapshot().unwrap();
+        let default = after.start_nodes.default_node();
+        assert_ne!(default, NodeId::new(1));
+        let label_1 = after.start_nodes.node_for_label(1).unwrap();
+        let label_2 = after.start_nodes.node_for_label(2).unwrap();
+        assert_eq!(label_1, NodeId::new(2));
+        assert_eq!(label_2, NodeId::new(3));
+
+        // Every surviving start entry points at a live record whose label set
+        // still matches the entry.
+        let records = index
+            .storage()
+            .read_nodes(
+                &after,
+                &[default, label_1, label_2],
+                &QueryBudget::default(),
+            )
+            .unwrap();
+        for (read, expected_label) in records.into_iter().zip([None, Some(1), Some(2)]) {
+            let NodeRead::Present(record) = read else {
+                panic!("start entry must point at a present record");
+            };
+            if let Some(label) = expected_label {
+                assert!(record.labels.iter().any(|value| *value == label));
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_start_repair_keeps_unreached_labeled_entries() {
+        let mut config = plain_config(2);
+        config.has_labels = true;
+        let vectors = vec![
+            labeled_input(1701, &[0.0, 0.0], &[]),
+            labeled_input(1702, &[1.0, 0.0], &[1]),
+            labeled_input(1703, &[2.0, 0.0], &[1]),
+            labeled_input(1704, &[10.0, 0.0], &[2]),
+            labeled_input(1705, &[11.0, 0.0], &[2]),
+        ];
+        let index = StreamingDiskAnnIndex::new_memory(config).unwrap();
+        index.bulk_build(vectors).unwrap();
+
+        let snapshot = index.snapshot().unwrap();
+        assert_eq!(snapshot.start_nodes.default_node(), NodeId::new(1));
+        assert_eq!(snapshot.start_nodes.node_for_label(1), Some(NodeId::new(2)));
+        assert_eq!(snapshot.start_nodes.node_for_label(2), Some(NodeId::new(4)));
+
+        // Budget so tight the walk visits only [default, deleted label-1
+        // start] and is truncated before reaching any label-2 node.
+        let mut budget = QueryBudget::default();
+        budget.max_visited = 2;
+        let repaired = index
+            .repair_start_nodes_after_delete(&snapshot, NodeId::new(2), &budget)
+            .unwrap()
+            .expect("deleting a start node must repair start nodes");
+
+        // Label 2 was never reached: its previous entry survives because it
+        // still points at a live node that is not the one being deleted.
+        // Without the truncation holdover this entry is silently dropped.
+        assert_eq!(repaired.node_for_label(2), Some(NodeId::new(4)));
+        // Label 1's entry pointed at the deleted node itself, and the
+        // truncated walk found no replacement, so it is dropped (documented).
+        assert_eq!(repaired.node_for_label(1), None);
+        // The default start was reached and survives.
+        assert_eq!(repaired.default_node(), NodeId::new(1));
     }
 
     #[test]
