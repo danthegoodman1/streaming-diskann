@@ -254,6 +254,32 @@ pub struct SearchOptions {
     pub search_list_size: usize,
     pub budget: QueryBudget,
     pub filter: Option<LabelSet>,
+    /// Whether hits are re-ranked with exact full-vector distances (default
+    /// `true`).
+    ///
+    /// With `rescore: true`, candidates found by graph traversal are re-scored
+    /// against their full vectors, so `SearchHit::distance` is always the
+    /// configured [`DistanceMetric`](crate::DistanceMetric) distance.
+    ///
+    /// With `rescore: false`, hits are ranked and returned with the *routing*
+    /// distances used during traversal, and what those numbers mean depends on
+    /// the index configuration:
+    ///
+    /// - Plain routing ([`QuantizerConfig::None`]): the configured metric
+    ///   computed over the routing vector (the first `routing_dimensions`
+    ///   components), which equals the exact distance only when
+    ///   `routing_dimensions == dimensions`.
+    /// - SBQ routing ([`QuantizerConfig::Sbq`]): the **Hamming distance
+    ///   between quantized bit vectors** (a non-negative bit count cast to
+    ///   `f32`). This is not an L2/cosine/inner-product distance; it is only a
+    ///   coarse similarity rank. Distances are comparable between hits of the
+    ///   same query but not across queries, index rebuilds, or metrics, and
+    ///   they are unrelated in scale to full-vector distances.
+    ///
+    /// Use `rescore: false` when only the candidate *ranking* matters and the
+    /// cost of full-vector reads should be avoided (e.g. pure routing-quality
+    /// benchmarks, or pipelines that re-rank externally). Keep the default
+    /// when `SearchHit::distance` must be a true metric distance.
     pub rescore: bool,
 }
 
@@ -449,29 +475,35 @@ mod tests {
 
     #[test]
     fn query_budget_rejects_zero_caps() {
-        let mut budget = QueryBudget::default();
-        budget.max_visited = 0;
-        assert!(matches!(budget.validate(), Err(Error::InvalidBudget(_))));
-
-        let mut budget = QueryBudget::default();
-        budget.max_candidates = 0;
-        assert!(matches!(budget.validate(), Err(Error::InvalidBudget(_))));
-
-        let mut budget = QueryBudget::default();
-        budget.max_read_batch = 0;
-        assert!(matches!(budget.validate(), Err(Error::InvalidBudget(_))));
-
-        let mut budget = QueryBudget::default();
-        budget.max_rescore = 0;
-        assert!(matches!(budget.validate(), Err(Error::InvalidBudget(_))));
-
-        let mut budget = QueryBudget::default();
-        budget.max_full_vector_bytes = 0;
-        assert!(matches!(budget.validate(), Err(Error::InvalidBudget(_))));
-
-        let mut budget = QueryBudget::default();
-        budget.max_query_bytes = 0;
-        assert!(matches!(budget.validate(), Err(Error::InvalidBudget(_))));
+        let budgets = [
+            QueryBudget {
+                max_visited: 0,
+                ..QueryBudget::default()
+            },
+            QueryBudget {
+                max_candidates: 0,
+                ..QueryBudget::default()
+            },
+            QueryBudget {
+                max_read_batch: 0,
+                ..QueryBudget::default()
+            },
+            QueryBudget {
+                max_rescore: 0,
+                ..QueryBudget::default()
+            },
+            QueryBudget {
+                max_full_vector_bytes: 0,
+                ..QueryBudget::default()
+            },
+            QueryBudget {
+                max_query_bytes: 0,
+                ..QueryBudget::default()
+            },
+        ];
+        for budget in budgets {
+            assert!(matches!(budget.validate(), Err(Error::InvalidBudget(_))));
+        }
     }
 
     #[test]

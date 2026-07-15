@@ -61,7 +61,7 @@ Status ledger:
 | Complete | Scope | New standalone workspace package | Added `streaming_diskann` workspace member with dependency-free crate skeleton. |
 | Complete | Scope | Postgres-free core types | Added `NodeId`, `ExternalId`, `IndexConfig`, `SearchOptions`, `QueryBudget`, `SearchHit`, `RoutingVector`, `NodeRecord`, and crate error/result types. |
 | Complete | Work | 1A: Copy/adapt pure distance and label modules | Added pure scalar distance functions, XOR distance, cosine preprocessing, sorted `LabelSet`, and focused unit tests. |
-| Complete | Work | 1B: Copy/adapt graph ordering, neighbor, and start-node primitives | Added `DistanceWithTieBreak`, `NeighborWithDistance`, and `StartNodes` over `NodeId` with ordering/start-node tests. |
+| Complete | Work | 1B: Copy/adapt graph ordering, neighbor, and start-node primitives | Added `DistanceWithTieBreak`, `NeighborWithDistance`, and `StartNodes` over `NodeId` with ordering/start-node tests (the first two were removed in the 2026-07 cleanup; pruning uses `(distance, id)` tie-breaks). |
 | Complete | Work | 1C: Copy/adapt SBQ quantizer without `MetaPage` dependency | Added standalone SBQ config, stats load/export, training, encoding, and round-trip tests without `MetaPage`. |
 | Complete | Gate | Standalone crate has no `pgrx` dependency | `cargo tree -p streaming_diskann` prints only `streaming_diskann v0.1.0`; no dependencies. |
 | Complete | Test | Core type and pure utility tests | `cargo test -p streaming_diskann` passed: 29 unit tests and doc-tests. |

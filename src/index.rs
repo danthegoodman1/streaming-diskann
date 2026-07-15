@@ -3296,8 +3296,10 @@ mod tests {
 
         // Budget so tight the walk visits only [default, deleted label-1
         // start] and is truncated before reaching any label-2 node.
-        let mut budget = QueryBudget::default();
-        budget.max_visited = 2;
+        let budget = QueryBudget {
+            max_visited: 2,
+            ..QueryBudget::default()
+        };
         let repaired = index
             .repair_start_nodes_after_delete(&snapshot, NodeId::new(2), &budget)
             .unwrap()

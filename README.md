@@ -84,6 +84,15 @@ at search time. Stored full vectors — including those returned through
 `FullVectorReader` — are the normalized values: inserting `[50.0, 50.0]` stores
 and rescores `[0.7071, 0.7071]`.
 
+Searches rescore by default (`SearchOptions::rescore: true`), so hit distances
+are exact metric distances. With `rescore: false`, hits carry the *routing*
+distances used during graph traversal instead: with SBQ routing that is the
+Hamming distance between quantized bit vectors (a bit count cast to `f32`, not
+an L2/cosine/inner-product distance), and with plain routing it is the metric
+over the `routing_dimensions`-length prefix. Disable rescoring only when the
+candidate ranking alone is enough and the distances themselves are not
+consumed; see the `SearchOptions::rescore` rustdoc for details.
+
 ### Storage Interfaces
 
 | Interface | Query hot path | Write hot path | Responsibility | Required guarantees |

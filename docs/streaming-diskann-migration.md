@@ -71,7 +71,7 @@ remain in `pgvectorscale/src/access_method`.
 | --- | --- | --- |
 | `access_method/distance/mod.rs` plus architecture-specific distance files | `src/distance.rs` | Standalone keeps scalar L2, cosine, inner product, and XOR distance with no PGRX init or SIMD dispatch. A future adapter can choose whether to expose extension SIMD implementations behind a non-Postgres feature. |
 | `access_method/labels/mod.rs` | `src/labels.rs` | `LabelSet` and `LabelSetView` semantics are adapted without `pgrx::Array`, `Datum`, `PgVector`, or archived label accessors. |
-| `access_method/graph/neighbor_with_distance.rs` | `src/graph/mod.rs` | `DistanceWithTieBreak` and `NeighborWithDistance` now use `NodeId` instead of `ItemPointer`/`IndexPointer`. |
+| `access_method/graph/neighbor_with_distance.rs` | `src/graph/mod.rs` | `DistanceWithTieBreak` and `NeighborWithDistance` now use `NodeId` instead of `ItemPointer`/`IndexPointer` (removed in the 2026-07 cleanup; pruning uses `(distance, id)` tie-breaks). |
 | `access_method/graph/start_nodes.rs` | `src/graph/mod.rs` and `ManifestSnapshot::start_nodes` | Start nodes are snapshot data keyed by `NodeId`; the extension currently stores them in `MetaPage`. |
 | `access_method/graph/mod.rs` | `src/index.rs` plus `NodeReader` | Candidate traversal, pruning, and visited/candidate bounds moved behind snapshot-based reads. Extension `ListSearchResult` still owns the current AM scan behavior. |
 | `access_method/sbq/quantize.rs` and SBQ means logic in `access_method/sbq/mod.rs` | `src/sbq.rs`, `QuantizerStore`, and `StoredQuantizer::Sbq` | Quantizer training and encoding are pure Rust. Page-chain persistence of means remains an extension storage concern. |

@@ -1,180 +1,18 @@
-//! Graph ordering and start-node primitives over standalone `NodeId` values.
+//! Start-node primitives over standalone `NodeId` values.
 //!
-//! Provenance: adapted from
-//! `pgvectorscale/src/access_method/graph/neighbor_with_distance.rs`,
-//! `graph/start_nodes.rs`, and selected traversal concepts from `graph/mod.rs`.
-//! Postgres `ItemPointer`/`IndexPointer` values are represented by `NodeId`.
+//! Provenance: adapted from `pgvectorscale/src/access_method/graph/start_nodes.rs`
+//! and selected traversal concepts from `graph/mod.rs`. Postgres
+//! `ItemPointer`/`IndexPointer` values are represented by `NodeId`.
+//!
+//! The upstream `neighbor_with_distance.rs` machinery (`DistanceWithTieBreak`,
+//! `NeighborWithDistance`) was removed in the 2026-07 review fixes: this
+//! crate's pruning and search paths use deterministic `(distance, node id)`
+//! tie-breaks directly, so the ID-space tie-break types had no callers.
 
-use std::cell::OnceCell;
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
 
 use crate::labels::{Label, LabelSet};
 use crate::NodeId;
-
-/// Distance score used by graph ordering.
-pub type Distance = f32;
-
-/// Distance plus deterministic tie-break metadata.
-///
-/// StreamingDiskANN often compares exact zero distances. The tie-break keeps
-/// ordering stable by considering the ID-space distance between the source and
-/// destination node.
-#[derive(Clone, Debug)]
-pub struct DistanceWithTieBreak {
-    distance: Distance,
-    from: NodeId,
-    to: NodeId,
-    distance_tie_break: OnceCell<u64>,
-}
-
-impl DistanceWithTieBreak {
-    /// Creates a distance between two graph nodes.
-    pub fn new(distance: Distance, from: NodeId, to: NodeId) -> Self {
-        assert!(distance.is_finite());
-        Self {
-            distance,
-            from,
-            to,
-            distance_tie_break: OnceCell::new(),
-        }
-    }
-
-    /// Creates a distance from a query to a graph node.
-    ///
-    /// Query distances do not need an ID-space tie-break source, so the
-    /// tie-break is fixed at zero.
-    pub fn with_query(distance: Distance, to: NodeId) -> Self {
-        assert!(distance.is_finite());
-        let distance_tie_break = OnceCell::new();
-        distance_tie_break.set(0).unwrap();
-        Self {
-            distance,
-            from: to,
-            to,
-            distance_tie_break,
-        }
-    }
-
-    /// Returns the raw distance score.
-    pub fn distance(&self) -> Distance {
-        self.distance
-    }
-
-    /// Returns the lazily computed deterministic tie-break.
-    pub fn distance_tie_break(&self) -> u64 {
-        *self
-            .distance_tie_break
-            .get_or_init(|| self.from.distance_to(self.to))
-    }
-
-    /// Returns the pruning factor between two distances.
-    pub fn factor_against(&self, divisor: &Self) -> f64 {
-        if divisor.distance().abs() < f32::EPSILON {
-            if self.distance().abs() < f32::EPSILON {
-                self.distance_tie_break() as f64 / divisor.distance_tie_break() as f64
-            } else {
-                f64::MAX
-            }
-        } else {
-            self.distance() as f64 / divisor.distance() as f64
-        }
-    }
-}
-
-impl PartialOrd for DistanceWithTieBreak {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for DistanceWithTieBreak {
-    fn cmp(&self, other: &Self) -> Ordering {
-        if self.distance == 0.0 && other.distance == 0.0 {
-            return self.distance_tie_break().cmp(&other.distance_tie_break());
-        }
-        self.distance.total_cmp(&other.distance)
-    }
-}
-
-impl PartialEq for DistanceWithTieBreak {
-    fn eq(&self, other: &Self) -> bool {
-        if self.distance == 0.0 && other.distance == 0.0 {
-            return self.distance_tie_break() == other.distance_tie_break();
-        }
-        self.distance == other.distance
-    }
-}
-
-impl Eq for DistanceWithTieBreak {}
-
-/// Neighbor candidate paired with its distance from an origin.
-#[derive(Clone, Debug)]
-pub struct NeighborWithDistance {
-    node_id: NodeId,
-    distance: DistanceWithTieBreak,
-    labels: Option<LabelSet>,
-}
-
-impl NeighborWithDistance {
-    /// Creates a neighbor candidate.
-    pub fn new(node_id: NodeId, distance: DistanceWithTieBreak, labels: Option<LabelSet>) -> Self {
-        Self {
-            node_id,
-            distance,
-            labels,
-        }
-    }
-
-    /// Returns the neighbor node ID.
-    pub fn node_id(&self) -> NodeId {
-        self.node_id
-    }
-
-    /// Returns the distance and tie-break metadata.
-    pub fn distance_with_tie_break(&self) -> &DistanceWithTieBreak {
-        &self.distance
-    }
-
-    /// Returns labels associated with the neighbor, when known.
-    pub fn labels(&self) -> Option<&LabelSet> {
-        self.labels.as_ref()
-    }
-
-    /// Returns true when two candidates refer to the same node.
-    pub fn same_node(&self, other: &Self) -> bool {
-        self.node_id == other.node_id
-    }
-}
-
-impl PartialOrd for NeighborWithDistance {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for NeighborWithDistance {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.distance
-            .cmp(&other.distance)
-            .then_with(|| self.node_id.cmp(&other.node_id))
-    }
-}
-
-impl PartialEq for NeighborWithDistance {
-    fn eq(&self, other: &Self) -> bool {
-        self.node_id == other.node_id && self.distance == other.distance
-    }
-}
-
-impl Eq for NeighborWithDistance {}
-
-impl Hash for NeighborWithDistance {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.node_id.hash(state);
-    }
-}
 
 /// Entry points used to start graph traversal.
 ///
@@ -270,37 +108,7 @@ impl StartNodes {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use super::*;
-
-    #[test]
-    fn orders_distances_with_node_id_tie_breaks() {
-        let origin = NodeId::new(10);
-        let close_tie = DistanceWithTieBreak::new(0.0, NodeId::new(11), origin);
-        let far_tie = DistanceWithTieBreak::new(0.0, NodeId::new(20), origin);
-        let non_zero = DistanceWithTieBreak::new(0.1, NodeId::new(1), origin);
-
-        let mut values = [non_zero.clone(), far_tie.clone(), close_tie.clone()];
-        values.sort();
-        assert_eq!(values[0], close_tie);
-        assert_eq!(values[1], far_tie);
-        assert_eq!(values[2], non_zero);
-    }
-
-    #[test]
-    fn neighbors_have_stable_ordering_and_explicit_identity() {
-        let node = NodeId::new(1);
-        let first =
-            NeighborWithDistance::new(node, DistanceWithTieBreak::with_query(1.0, node), None);
-        let second =
-            NeighborWithDistance::new(node, DistanceWithTieBreak::with_query(2.0, node), None);
-        let mut set = BTreeSet::new();
-        set.insert(first.clone());
-        set.insert(second.clone());
-        assert_eq!(set.len(), 2, "ordering follows distance, not node equality");
-        assert!(first.same_node(&second));
-    }
 
     #[test]
     fn start_nodes_route_unlabeled_and_labeled_queries() {
@@ -326,16 +134,6 @@ mod tests {
                 (Some(10), NodeId::new(10)),
                 (Some(20), NodeId::new(20))
             ]
-        );
-    }
-
-    #[test]
-    fn computes_pruning_factor() {
-        let candidate_to_point = DistanceWithTieBreak::new(4.0, NodeId::new(1), NodeId::new(100));
-        let candidate_to_neighbor = DistanceWithTieBreak::new(2.0, NodeId::new(1), NodeId::new(2));
-        assert_eq!(
-            candidate_to_point.factor_against(&candidate_to_neighbor),
-            2.0
         );
     }
 }

@@ -587,21 +587,31 @@ impl<R: NodeReader> NodeReader for CachedNodeReader<R> {
         budget: &QueryBudget,
     ) -> Result<Vec<NodeRead>> {
         enforce_node_batch(node_ids, budget)?;
-        let snapshot_key = SnapshotCacheKey::from_snapshot(snapshot);
+        // Built once per request; entries share it via `Arc`, so per-node key
+        // handling never clones the `Vec`s inside the snapshot key.
+        let snapshot_key = Arc::new(SnapshotCacheKey::from_snapshot(snapshot));
 
         let mut missing = Vec::new();
-        let mut reads_by_key = BTreeMap::new();
+        let mut missing_set = BTreeSet::new();
+        let mut reads_by_node = BTreeMap::new();
         {
             let cache = self
                 .cache
                 .lock()
                 .map_err(|_| Error::Storage("cached node reader mutex was poisoned".to_string()))?;
-            for node_id in node_ids {
-                let key = (snapshot_key.clone(), *node_id);
-                if let Some(read) = cache.entries.get(&key) {
-                    reads_by_key.insert(key, read.clone());
-                } else if !missing.contains(node_id) {
-                    missing.push(*node_id);
+            if let Some(nodes) = cache.snapshots.get(&snapshot_key) {
+                for node_id in node_ids {
+                    if let Some(read) = nodes.get(node_id) {
+                        reads_by_node.insert(*node_id, read.clone());
+                    } else if missing_set.insert(*node_id) {
+                        missing.push(*node_id);
+                    }
+                }
+            } else {
+                for node_id in node_ids {
+                    if missing_set.insert(*node_id) {
+                        missing.push(*node_id);
+                    }
                 }
             }
         }
@@ -620,24 +630,21 @@ impl<R: NodeReader> NodeReader for CachedNodeReader<R> {
                 .lock()
                 .map_err(|_| Error::Storage("cached node reader mutex was poisoned".to_string()))?;
             for read in fetched {
-                let key = (snapshot_key.clone(), read.node_id());
-                reads_by_key.insert(key.clone(), read.clone());
-                cache.insert(key, read, self.max_entries);
+                let node_id = read.node_id();
+                reads_by_node.insert(node_id, read.clone());
+                cache.insert(&snapshot_key, node_id, read, self.max_entries);
             }
         }
 
         let reads = node_ids
             .iter()
             .map(|node_id| {
-                reads_by_key
-                    .get(&(snapshot_key.clone(), *node_id))
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::Storage(format!(
-                            "cached reader missing node {} after fetch",
-                            node_id.get()
-                        ))
-                    })
+                reads_by_node.get(node_id).cloned().ok_or_else(|| {
+                    Error::Storage(format!(
+                        "cached reader missing node {} after fetch",
+                        node_id.get()
+                    ))
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         enforce_node_read_memory_budget(&reads, budget)?;
@@ -645,32 +652,44 @@ impl<R: NodeReader> NodeReader for CachedNodeReader<R> {
     }
 }
 
+/// Shared cache state: a per-snapshot node map plus a global FIFO used for
+/// cross-snapshot eviction when a capacity is configured.
 #[derive(Debug, Default)]
 struct CachedNodeReaderState {
-    entries: BTreeMap<(SnapshotCacheKey, NodeId), NodeRead>,
-    insertion_order: VecDeque<(SnapshotCacheKey, NodeId)>,
+    snapshots: BTreeMap<Arc<SnapshotCacheKey>, BTreeMap<NodeId, NodeRead>>,
+    entry_count: usize,
+    insertion_order: VecDeque<(Arc<SnapshotCacheKey>, NodeId)>,
 }
 
 impl CachedNodeReaderState {
     fn insert(
         &mut self,
-        key: (SnapshotCacheKey, NodeId),
+        snapshot_key: &Arc<SnapshotCacheKey>,
+        node_id: NodeId,
         read: NodeRead,
         max_entries: Option<usize>,
     ) {
         if max_entries == Some(0) {
             return;
         }
-        if !self.entries.contains_key(&key) {
-            self.insertion_order.push_back(key.clone());
+        let nodes = self.snapshots.entry(Arc::clone(snapshot_key)).or_default();
+        if nodes.insert(node_id, read).is_none() {
+            self.entry_count += 1;
+            self.insertion_order
+                .push_back((Arc::clone(snapshot_key), node_id));
         }
-        self.entries.insert(key, read);
         if let Some(max_entries) = max_entries {
-            while self.entries.len() > max_entries {
-                if let Some(evicted) = self.insertion_order.pop_front() {
-                    self.entries.remove(&evicted);
-                } else {
+            while self.entry_count > max_entries {
+                let Some((evicted_key, evicted_node)) = self.insertion_order.pop_front() else {
                     break;
+                };
+                if let Some(evicted_nodes) = self.snapshots.get_mut(&evicted_key) {
+                    if evicted_nodes.remove(&evicted_node).is_some() {
+                        self.entry_count -= 1;
+                    }
+                    if evicted_nodes.is_empty() {
+                        self.snapshots.remove(&evicted_key);
+                    }
                 }
             }
         }
@@ -768,6 +787,18 @@ fn distance_metric_key(metric: DistanceMetric) -> u8 {
 /// `MemoryStorage` is intended for tests, examples, and conformance fixtures.
 /// It models the same snapshot/hot-delta/mutation-log boundaries that a durable
 /// backend must implement, but it does not provide process-external durability.
+///
+/// # Hot-delta retention
+///
+/// Frozen hot deltas share record payloads via `Arc`, and each
+/// [`HotDeltaStore::publish_hot_delta`] garbage-collects frozen deltas that are
+/// neither among the [`RETAINED_FROZEN_HOT_DELTAS`] newest nor referenced by
+/// the currently published manifest, so retained state stays linear in live
+/// data across online inserts. A pinned snapshot that is at most one publish
+/// old always resolves; once more than one subsequent publish has elapsed
+/// (i.e., [`RETAINED_FROZEN_HOT_DELTAS`] or more), hot-delta reads through it
+/// may fail with a deterministic [`Error::StorageNotFound`]; see
+/// `publish_hot_delta` for the full rule.
 #[derive(Clone, Debug)]
 pub struct MemoryStorage {
     inner: Arc<Mutex<MemoryState>>,
@@ -982,7 +1013,10 @@ impl MutableNodeStore for MemoryStorage {
         let mut state = self.lock()?;
         state.draft_delta.tombstones.remove(&record.id);
         state.draft_delta.neighbor_rewrites.remove(&record.id);
-        state.draft_delta.records.insert(record.id, record);
+        state
+            .draft_delta
+            .records
+            .insert(record.id, Arc::new(record));
         Ok(())
     }
 
@@ -995,7 +1029,9 @@ impl MutableNodeStore for MemoryStorage {
         validate_neighbors(node_id, &neighbors, config)?;
         let mut state = self.lock()?;
         if let Some(record) = state.draft_delta.records.get_mut(&node_id) {
-            record.neighbors = neighbors;
+            // Copy-on-write: if this record is shared with a frozen delta,
+            // `make_mut` clones it so published snapshots stay immutable.
+            Arc::make_mut(record).neighbors = neighbors;
         } else {
             state
                 .draft_delta
@@ -1021,7 +1057,33 @@ impl MutableNodeStore for MemoryStorage {
     }
 }
 
+/// Number of most-recent frozen hot deltas [`MemoryStorage`] retains.
+///
+/// See [`MemoryStorage`]'s `HotDeltaStore::publish_hot_delta` implementation
+/// for the retention/GC rule this constant parameterizes.
+pub const RETAINED_FROZEN_HOT_DELTAS: usize = 2;
+
 impl HotDeltaStore for MemoryStorage {
+    /// Freezes the cumulative draft into a new hot delta and garbage-collects
+    /// superseded frozen deltas.
+    ///
+    /// Record payloads are shared (`Arc`) between the draft and every frozen
+    /// delta, so a publish retains only the new/changed records since the
+    /// previous publish plus O(delta size) map entries, not a deep copy of the
+    /// cumulative draft.
+    ///
+    /// GC rule (reference-backend semantics): after freezing, only the
+    /// [`RETAINED_FROZEN_HOT_DELTAS`] newest frozen deltas plus the delta
+    /// referenced by the currently published manifest are kept. This keeps
+    /// retained state linear in the amount of live data across any number of
+    /// publishes. Readers that pinned the current manifest (or a manifest at
+    /// most one publish old) always resolve; a reader that pins a snapshot and
+    /// then lets more than one subsequent publish elapse (i.e.,
+    /// [`RETAINED_FROZEN_HOT_DELTAS`] or more — GC runs at freeze time, before
+    /// the manifest advances) gets a deterministic [`Error::StorageNotFound`]
+    /// rather than stale or corrupt data. Durable backends are expected to
+    /// implement their own pinning or
+    /// epoch-based retention; `MemoryStorage` stays a reference/test backend.
     fn publish_hot_delta(&self) -> Result<PublishedHotDelta> {
         let mut state = self.lock()?;
         let reference = HotDeltaRef::new(state.next_hot_delta_id);
@@ -1036,11 +1098,14 @@ impl HotDeltaStore for MemoryStorage {
             .unwrap_or_else(TombstoneEpoch::default);
         let start_nodes = state.draft_delta.start_nodes.clone();
         let frozen = FrozenHotDelta {
+            // Shares `Arc<NodeRecord>` payloads with the draft and with all
+            // previously frozen deltas; only map entries are copied.
             records: state.draft_delta.records.clone(),
             neighbor_rewrites: state.draft_delta.neighbor_rewrites.clone(),
             tombstones: state.draft_delta.tombstones.clone(),
         };
         state.hot_deltas.insert(reference, frozen);
+        collect_superseded_hot_deltas(&mut state);
 
         Ok(PublishedHotDelta {
             hot_delta: reference,
@@ -1048,6 +1113,27 @@ impl HotDeltaStore for MemoryStorage {
             tombstone_epoch,
         })
     }
+}
+
+/// Drops frozen hot deltas superseded by newer publishes.
+///
+/// Keeps the [`RETAINED_FROZEN_HOT_DELTAS`] newest frozen deltas and the delta
+/// referenced by the currently published manifest (which must always stay
+/// resolvable for readers of the current snapshot).
+fn collect_superseded_hot_deltas(state: &mut MemoryState) {
+    let manifest_delta = state.manifest.hot_delta;
+    let newest_retained = state
+        .hot_deltas
+        .keys()
+        .rev()
+        .nth(RETAINED_FROZEN_HOT_DELTAS - 1)
+        .copied();
+    let Some(newest_retained) = newest_retained else {
+        return;
+    };
+    state
+        .hot_deltas
+        .retain(|reference, _| *reference >= newest_retained || Some(*reference) == manifest_delta);
 }
 
 impl MutationLog for MemoryStorage {
@@ -1153,9 +1239,14 @@ struct MemoryState {
     log_entries: VecDeque<MutationLogEntry>,
 }
 
+/// Mutable hot-delta draft accumulated between publishes.
+///
+/// Records are stored behind `Arc` so freezing the draft into a
+/// [`FrozenHotDelta`] shares record payloads with previously frozen deltas
+/// instead of deep-cloning the cumulative draft on every publish.
 #[derive(Clone, Default, Debug)]
 struct HotDeltaDraft {
-    records: BTreeMap<NodeId, NodeRecord>,
+    records: BTreeMap<NodeId, Arc<NodeRecord>>,
     neighbor_rewrites: BTreeMap<NodeId, Vec<NodeId>>,
     tombstones: BTreeMap<NodeId, TombstoneEpoch>,
     start_nodes: Option<StartNodes>,
@@ -1163,7 +1254,7 @@ struct HotDeltaDraft {
 
 #[derive(Debug)]
 struct FrozenHotDelta {
-    records: BTreeMap<NodeId, NodeRecord>,
+    records: BTreeMap<NodeId, Arc<NodeRecord>>,
     neighbor_rewrites: BTreeMap<NodeId, Vec<NodeId>>,
     tombstones: BTreeMap<NodeId, TombstoneEpoch>,
 }
@@ -1261,9 +1352,7 @@ pub(crate) fn checked_mul(left: usize, right: usize) -> Result<usize> {
 }
 
 pub(crate) fn checked_sum<const N: usize>(values: [usize; N]) -> Result<usize> {
-    values
-        .into_iter()
-        .try_fold(0_usize, |total, value| checked_add(total, value))
+    values.into_iter().try_fold(0_usize, checked_add)
 }
 
 fn validate_manifest_references(state: &MemoryState, snapshot: &ManifestSnapshot) -> Result<()> {
@@ -2463,6 +2552,9 @@ pub mod conformance {
     }
 
     /// Verifies a concrete `NodeReader` against a supplied fixture.
+    // The argument list mirrors the fixture fields one-to-one; bundling them
+    // into a struct would only add indirection for backend test authors.
+    #[allow(clippy::too_many_arguments)]
     pub fn assert_node_reader_conformance<R: NodeReader>(
         reader: &R,
         snapshot: &ManifestSnapshot,
@@ -3353,6 +3445,102 @@ mod tests {
 
         let counting = cached.into_inner();
         assert_eq!(counting.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Regression test for the O(n^2) hot-delta retention bug: publishing the
+    /// cumulative draft used to deep-clone every record into a new frozen
+    /// delta and never drop old deltas, retaining sum(1..n) = n(n+1)/2 record
+    /// copies after n online inserts.
+    #[test]
+    fn online_inserts_retain_linear_hot_delta_records() {
+        use crate::index::StreamingDiskAnnIndex;
+        use crate::labels::LabelSet;
+
+        let mut config = base_config();
+        config.dimensions = 4;
+        config.routing_dimensions = 4;
+        config.max_neighbors = 8;
+        config.build_search_list_size = 16;
+        let store = MemoryStorage::empty(config.clone(), StartNodes::new(NodeId::new(1))).unwrap();
+        let index = StreamingDiskAnnIndex::from_storage(store.clone()).unwrap();
+        index
+            .bulk_build(vec![
+                crate::index::VectorInput::new(
+                    1_u64,
+                    vec![0.0, 0.0, 0.0, 0.0],
+                    LabelSet::default(),
+                ),
+                crate::index::VectorInput::new(
+                    2_u64,
+                    vec![1.0, 0.0, 0.0, 0.0],
+                    LabelSet::default(),
+                ),
+            ])
+            .unwrap();
+
+        let inserts = 32_usize;
+        for idx in 0..inserts {
+            index
+                .insert(
+                    100 + idx as u64,
+                    vec![idx as f32, 1.0, 0.0, 0.0],
+                    LabelSet::default(),
+                )
+                .unwrap();
+        }
+
+        let state = store.lock().unwrap();
+        // Each publish is retained by ref-count, not by deep copy, and old
+        // frozen deltas are garbage-collected: at most the K newest plus the
+        // manifest-referenced delta survive.
+        assert!(
+            state.hot_deltas.len() <= RETAINED_FROZEN_HOT_DELTAS + 1,
+            "retained {} frozen deltas, expected at most {}",
+            state.hot_deltas.len(),
+            RETAINED_FROZEN_HOT_DELTAS + 1
+        );
+
+        // Total retained record entries across the draft and all frozen
+        // deltas must be O(n), not O(n^2). With K = 2 retained deltas the
+        // bound is (K + 1) * n; the pre-fix behavior retains n(n+1)/2 = 528
+        // entries for n = 32.
+        let retained_entries = state.draft_delta.records.len()
+            + state
+                .hot_deltas
+                .values()
+                .map(|delta| delta.records.len())
+                .sum::<usize>();
+        let linear_bound = (RETAINED_FROZEN_HOT_DELTAS + 2) * inserts;
+        assert!(
+            retained_entries <= linear_bound,
+            "retained {retained_entries} record entries after {inserts} inserts, \
+             expected linear bound {linear_bound}"
+        );
+
+        // Record payloads are shared between the draft and frozen deltas:
+        // the number of distinct allocations is far below the entry count.
+        let mut distinct = BTreeSet::new();
+        for record in state.draft_delta.records.values() {
+            distinct.insert(Arc::as_ptr(record) as usize);
+        }
+        for delta in state.hot_deltas.values() {
+            for record in delta.records.values() {
+                distinct.insert(Arc::as_ptr(record) as usize);
+            }
+        }
+        assert!(
+            distinct.len() < retained_entries,
+            "expected shared record payloads, got {} distinct allocations for {} entries",
+            distinct.len(),
+            retained_entries
+        );
+        // COW rewrites (backpointer updates against frozen records) may clone
+        // some payloads, but distinct allocations stay linear in n as well.
+        assert!(
+            distinct.len() <= linear_bound,
+            "expected O(n) distinct record allocations, got {}",
+            distinct.len()
+        );
     }
 
     #[test]

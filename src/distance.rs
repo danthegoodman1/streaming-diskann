@@ -32,45 +32,68 @@ impl DistanceMetric {
     }
 }
 
-#[inline(always)]
+/// Number of independent accumulators used by the vectorizable kernels.
+///
+/// Eight `f32` lanes give the optimizer two 128-bit (NEON/SSE) or one 256-bit
+/// (AVX) vector of accumulators and break the sequential floating-point
+/// dependency chain of a naive `sum()`, which LLVM cannot reassociate on its
+/// own. This is stable Rust: the loops below are written so that
+/// auto-vectorization applies; no `std::simd` or intrinsics are used.
+const KERNEL_LANES: usize = 8;
+
+#[inline]
 /// Squared Euclidean distance.
+///
+/// Multi-accumulator loop over `KERNEL_LANES`-wide chunks with a scalar
+/// remainder; results can differ from a strictly sequential sum only by
+/// floating-point reassociation error.
 pub fn distance_l2(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
-    let norm: f32 = a
-        .iter()
-        .zip(b.iter())
-        .map(|(left, right)| {
-            let diff = left - right;
-            diff * diff
-        })
-        .sum();
+    let mut lanes = [0.0_f32; KERNEL_LANES];
+    let mut chunks_a = a.chunks_exact(KERNEL_LANES);
+    let mut chunks_b = b.chunks_exact(KERNEL_LANES);
+    for (chunk_a, chunk_b) in (&mut chunks_a).zip(&mut chunks_b) {
+        for lane in 0..KERNEL_LANES {
+            let diff = chunk_a[lane] - chunk_b[lane];
+            lanes[lane] += diff * diff;
+        }
+    }
+    let mut norm = sum_lanes(lanes);
+    for (left, right) in chunks_a.remainder().iter().zip(chunks_b.remainder()) {
+        let diff = left - right;
+        norm += diff * diff;
+    }
     debug_assert!(norm >= 0.0);
     norm
 }
 
 #[inline]
-/// Squared Euclidean distance with a small-dimension dispatch fast path.
-pub fn distance_l2_optimized_for_few_dimensions(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len());
-    match a.len() {
-        0 => 0.0,
-        1 => distance_l2(&a[..1], &b[..1]),
-        2 => distance_l2(&a[..2], &b[..2]),
-        3 => distance_l2(&a[..3], &b[..3]),
-        4 => distance_l2(&a[..4], &b[..4]),
-        5 => distance_l2(&a[..5], &b[..5]),
-        6 => distance_l2(&a[..6], &b[..6]),
-        7 => distance_l2(&a[..7], &b[..7]),
-        8 => distance_l2(&a[..8], &b[..8]),
-        _ => distance_l2(a, b),
-    }
-}
-
-#[inline(always)]
 /// Dot product between equal-length vectors.
+///
+/// Multi-accumulator loop over `KERNEL_LANES`-wide chunks with a scalar
+/// remainder; results can differ from a strictly sequential sum only by
+/// floating-point reassociation error.
 pub fn inner_product(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
-    a.iter().zip(b).map(|(left, right)| left * right).sum()
+    let mut lanes = [0.0_f32; KERNEL_LANES];
+    let mut chunks_a = a.chunks_exact(KERNEL_LANES);
+    let mut chunks_b = b.chunks_exact(KERNEL_LANES);
+    for (chunk_a, chunk_b) in (&mut chunks_a).zip(&mut chunks_b) {
+        for lane in 0..KERNEL_LANES {
+            lanes[lane] += chunk_a[lane] * chunk_b[lane];
+        }
+    }
+    let mut product = sum_lanes(lanes);
+    for (left, right) in chunks_a.remainder().iter().zip(chunks_b.remainder()) {
+        product += left * right;
+    }
+    product
+}
+
+#[inline]
+fn sum_lanes(lanes: [f32; KERNEL_LANES]) -> f32 {
+    ((lanes[0] + lanes[4]) + (lanes[1] + lanes[5]))
+        + ((lanes[2] + lanes[6]) + (lanes[3] + lanes[7]))
 }
 
 #[inline]
@@ -185,13 +208,73 @@ fn xor_count(a: &[u64], b: &[u64], len: usize) -> usize {
 mod tests {
     use super::*;
 
+    /// Naive sequential-sum reference implementation of squared L2.
+    fn scalar_distance_l2(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b.iter())
+            .map(|(left, right)| {
+                let diff = left - right;
+                diff * diff
+            })
+            .sum()
+    }
+
+    /// Naive sequential-sum reference implementation of the dot product.
+    fn scalar_inner_product(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter().zip(b).map(|(left, right)| left * right).sum()
+    }
+
+    /// Deterministic pseudo-random vector in [-1, 1), matching the generator
+    /// used by `examples/bench.rs`.
+    fn deterministic_vector(seed: u64, dimensions: usize) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (0..dimensions)
+            .map(|dimension| {
+                state = state
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(3037000493 + dimension as u64);
+                let bucket = ((state >> 33) as u32) as f32 / u32::MAX as f32;
+                bucket * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn assert_close(actual: f32, expected: f32, context: &str) {
+        let tolerance = 1e-4_f32 * expected.abs().max(1.0);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{context}: vectorized {actual} differs from scalar {expected}"
+        );
+    }
+
     #[test]
     fn computes_l2_without_sqrt() {
         assert_eq!(distance_l2(&[1.0, 2.0, 3.0], &[1.0, 4.0, 0.0]), 13.0);
-        assert_eq!(
-            distance_l2_optimized_for_few_dimensions(&[1.0, 2.0], &[3.0, 5.0]),
-            13.0
-        );
+        assert_eq!(distance_l2(&[1.0, 2.0], &[3.0, 5.0]), 13.0);
+    }
+
+    #[test]
+    fn vectorized_kernels_match_scalar_reference() {
+        // Lengths cover the empty case, sub-chunk sizes, exact multiples of
+        // the 8-lane kernel width, and odd remainders around each boundary.
+        for len in [
+            0, 1, 2, 3, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 100, 257,
+        ] {
+            let a = deterministic_vector(41 + len as u64, len);
+            let b = deterministic_vector(97 + len as u64, len);
+            assert_close(
+                distance_l2(&a, &b),
+                scalar_distance_l2(&a, &b),
+                &format!("distance_l2 len={len}"),
+            );
+            assert_close(
+                inner_product(&a, &b),
+                scalar_inner_product(&a, &b),
+                &format!("inner_product len={len}"),
+            );
+        }
     }
 
     #[test]
