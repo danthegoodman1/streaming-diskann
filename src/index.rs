@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+use std::collections::{BTreeSet, BinaryHeap, VecDeque};
 use std::mem::size_of;
 use std::sync::{Arc, Mutex};
 
@@ -229,13 +229,17 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
 
         self.assign_bulk_neighbors(&mut records)?;
 
-        let start_nodes = start_nodes_for_records(records.iter().map(routing_from_node));
+        let record_count = records.len();
+        let start_nodes =
+            start_nodes_for_records(records.iter().map(|record| (record.id, &record.labels)));
         let segment = if records.is_empty() {
             None
         } else {
+            // Graph wiring is complete, so the records are moved (not cloned)
+            // into the immutable segment.
             Some(
                 self.storage
-                    .insert_immutable_segment(records.clone(), &self.config)?,
+                    .insert_immutable_segment(records, &self.config)?,
             )
         };
 
@@ -249,12 +253,12 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
         replacement.quantizers = quantizers;
         // Bulk build replaces the visible graph and clears tombstones, so the
         // node-ID space restarts at the newly assigned IDs.
-        replacement.max_assigned_node_id = Some(NodeId::new(records.len() as u64));
+        replacement.max_assigned_node_id = Some(NodeId::new(record_count as u64));
 
         let published = self
             .storage
             .compare_and_publish(current.version, replacement)?;
-        self.set_next_node_id(records.len() as u64 + 1)?;
+        self.set_next_node_id(record_count as u64 + 1)?;
         Ok(published)
     }
 
@@ -566,8 +570,12 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
         let snapshot = self.storage.load_snapshot()?;
         let replacement_starts = if snapshot.start_nodes.all_nodes().contains(&node_id) {
             let records = self.collect_reachable_records(&snapshot, &QueryBudget::default())?;
-            let remaining = records.into_iter().filter(|record| record.id != node_id);
-            Some(start_nodes_for_records(remaining))
+            Some(start_nodes_for_records(
+                records
+                    .iter()
+                    .filter(|record| record.id != node_id)
+                    .map(|record| (record.id, &record.labels)),
+            ))
         } else {
             None
         };
@@ -666,32 +674,148 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
         }
     }
 
+    /// Wires bulk-build neighbor lists with the Vamana incremental algorithm.
+    ///
+    /// Each record, in input order, greedy-searches the partial graph built
+    /// from the records processed before it (seeded at the first record, the
+    /// future default start node), α-prunes the visited candidates into its
+    /// own neighbor list, then installs reverse edges on the chosen
+    /// neighbors. Reverse-edge lists may grow up to
+    /// `max_neighbors_during_build` (`max_neighbors * GRAPH_SLACK_FACTOR`)
+    /// before an α-re-prune shrinks them back to `max_neighbors`. Traversal
+    /// and pruning use deterministic `(distance, node id)` ordering, so the
+    /// same input always produces the same graph.
     fn assign_bulk_neighbors(&self, records: &mut [NodeRecord]) -> Result<()> {
-        let record_lookup: BTreeMap<_, _> = records
+        // Bulk build assigns contiguous IDs 1..=n in input order, which lets
+        // the in-memory wiring below use `id - 1` as the slice index.
+        debug_assert!(records
             .iter()
-            .map(|record| (record.id, routing_from_node(record)))
-            .collect();
+            .enumerate()
+            .all(|(idx, record)| record.id.get() == idx as u64 + 1));
 
-        for idx in 0..records.len() {
-            let base = routing_from_node(&records[idx]);
-            let mut candidates = Vec::new();
-            for candidate in record_lookup.values() {
-                if candidate.id != base.id {
-                    candidates.push(candidate.clone());
+        let max_during_build = self.config.max_neighbors_during_build();
+        let search_list_size = self
+            .config
+            .build_search_list_size
+            .max(self.config.max_neighbors)
+            .max(1);
+
+        for idx in 1..records.len() {
+            let visited = self.bulk_greedy_search(records, idx, search_list_size)?;
+            let views = visited
+                .iter()
+                .filter(|(_, candidate_idx)| *candidate_idx != idx)
+                .map(|&(distance, candidate_idx)| prune_view(&records[candidate_idx], distance))
+                .collect();
+            let neighbors = self.alpha_prune_candidates(
+                &records[idx].labels,
+                views,
+                self.config.max_neighbors,
+            )?;
+
+            let new_id = records[idx].id;
+            for neighbor_id in &neighbors {
+                let neighbor_idx = (neighbor_id.get() - 1) as usize;
+                if !records[neighbor_idx].neighbors.contains(&new_id) {
+                    records[neighbor_idx].neighbors.push(new_id);
+                    if records[neighbor_idx].neighbors.len() > max_during_build {
+                        self.reprune_bulk_neighbors(records, neighbor_idx)?;
+                    }
                 }
             }
-            let mut neighbors = self.prune_neighbor_records(&base, candidates)?;
+            records[idx].neighbors = neighbors;
+        }
+
+        for idx in 0..records.len() {
+            // Shrink any list still holding slack edges to the published cap.
+            if records[idx].neighbors.len() > self.config.max_neighbors {
+                self.reprune_bulk_neighbors(records, idx)?;
+            }
             if records.len() > 1 {
+                // Chain insurance edge, as in the previous all-pairs build:
+                // node i always links to node i+1 (the last node links back),
+                // so every node stays reachable from the start node even if
+                // α-pruning dropped all of its other in-edges.
                 let chain_neighbor = if idx + 1 < records.len() {
                     records[idx + 1].id
                 } else {
                     records[idx - 1].id
                 };
-                ensure_neighbor(&mut neighbors, chain_neighbor, self.config.max_neighbors);
+                ensure_neighbor(
+                    &mut records[idx].neighbors,
+                    chain_neighbor,
+                    self.config.max_neighbors,
+                );
             }
-            records[idx].neighbors = neighbors;
             records[idx].validate(&self.config)?;
         }
+        Ok(())
+    }
+
+    /// Best-first walk over the in-memory partial graph during bulk build.
+    ///
+    /// Mirrors `search_with_snapshot`'s traversal (min-heap ordered by
+    /// distance then node ID, visited cap = `search_list_size`) but reads
+    /// records directly from the slice being wired instead of storage.
+    /// Returns the visited candidates as `(distance to query, record index)`
+    /// pairs in visit order.
+    fn bulk_greedy_search(
+        &self,
+        records: &[NodeRecord],
+        query_idx: usize,
+        search_list_size: usize,
+    ) -> Result<Vec<(f32, usize)>> {
+        let query_routing = &records[query_idx].routing_vector;
+        let mut heap = BinaryHeap::new();
+        let mut seen = BTreeSet::new();
+        let mut visited = Vec::new();
+
+        let start_distance =
+            routing_distance_between(&self.config, query_routing, &records[0].routing_vector)?;
+        // `QueuedNode.slot` carries the record's slice index during build.
+        heap.push(Reverse(QueuedNode::new(records[0].id, start_distance, 0)));
+        seen.insert(records[0].id);
+
+        while let Some(Reverse(candidate)) = heap.pop() {
+            if visited.len() >= search_list_size {
+                break;
+            }
+            visited.push((candidate.distance, candidate.slot));
+            for neighbor in &records[candidate.slot].neighbors {
+                if seen.insert(*neighbor) {
+                    let neighbor_idx = (neighbor.get() - 1) as usize;
+                    let distance = routing_distance_between(
+                        &self.config,
+                        query_routing,
+                        &records[neighbor_idx].routing_vector,
+                    )?;
+                    heap.push(Reverse(QueuedNode::new(*neighbor, distance, neighbor_idx)));
+                }
+            }
+        }
+        Ok(visited)
+    }
+
+    /// Re-prunes a bulk-build neighbor list back to `max_neighbors` with α.
+    ///
+    /// Used when a reverse edge pushes a list past the
+    /// `max_neighbors_during_build` slack bound, and by the final pass that
+    /// shrinks remaining slack lists before validation.
+    fn reprune_bulk_neighbors(&self, records: &mut [NodeRecord], idx: usize) -> Result<()> {
+        let neighbor_ids = std::mem::take(&mut records[idx].neighbors);
+        let mut views = Vec::with_capacity(neighbor_ids.len());
+        for neighbor_id in &neighbor_ids {
+            let neighbor_idx = (neighbor_id.get() - 1) as usize;
+            let distance = routing_distance_between(
+                &self.config,
+                &records[idx].routing_vector,
+                &records[neighbor_idx].routing_vector,
+            )?;
+            views.push(prune_view(&records[neighbor_idx], distance));
+        }
+        let pruned =
+            self.alpha_prune_candidates(&records[idx].labels, views, self.config.max_neighbors)?;
+        records[idx].neighbors = pruned;
         Ok(())
     }
 
@@ -925,42 +1049,60 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
     fn prune_neighbor_records(
         &self,
         base: &RoutingNodeRecord,
-        mut candidates: Vec<RoutingNodeRecord>,
+        candidates: Vec<RoutingNodeRecord>,
     ) -> Result<Vec<NodeId>> {
-        candidates.retain(|candidate| candidate.id != base.id);
         // Compute each candidate's `(distance, id)` sort key once up front so
         // the comparator never recomputes distances and distance errors are
         // propagated instead of being mapped to `Ordering::Equal`.
-        let mut keyed = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
+        let mut views = Vec::with_capacity(candidates.len());
+        for candidate in &candidates {
+            if candidate.id == base.id {
+                continue;
+            }
             let distance = routing_distance_between(
                 &self.config,
                 &base.routing_vector,
                 &candidate.routing_vector,
             )?;
-            keyed.push((distance, candidate));
+            views.push(PruneCandidate {
+                id: candidate.id,
+                distance,
+                routing_vector: &candidate.routing_vector,
+                labels: &candidate.labels,
+            });
         }
-        keyed.sort_by(|(left_distance, left), (right_distance, right)| {
-            rank_distance(*left_distance, *right_distance).then_with(|| left.id.cmp(&right.id))
+        self.alpha_prune_candidates(&base.labels, views, self.config.max_neighbors)
+    }
+
+    /// α-prunes pre-scored candidates down to at most `max_neighbors` IDs.
+    ///
+    /// Candidates are ordered by `(distance, id)`, deduplicated by ID, and
+    /// selected with the escalating-α occlusion rule shared by the online
+    /// insert path and the bulk build. `distance` on each view is the
+    /// candidate's routing distance to the prune base.
+    fn alpha_prune_candidates(
+        &self,
+        base_labels: &LabelSet,
+        mut candidates: Vec<PruneCandidate<'_>>,
+        max_neighbors: usize,
+    ) -> Result<Vec<NodeId>> {
+        candidates.sort_by(|left, right| {
+            rank_distance(left.distance, right.distance).then_with(|| left.id.cmp(&right.id))
         });
-        keyed.dedup_by_key(|(_, candidate)| candidate.id);
-        if keyed.len() <= self.config.max_neighbors {
-            return Ok(keyed
+        candidates.dedup_by_key(|candidate| candidate.id);
+        if candidates.len() <= max_neighbors {
+            return Ok(candidates
                 .into_iter()
-                .map(|(_, candidate)| candidate.id)
+                .map(|candidate| candidate.id)
                 .collect());
         }
 
-        let distances_to_base: Vec<f32> = keyed.iter().map(|(distance, _)| *distance).collect();
-        let candidates: Vec<RoutingNodeRecord> =
-            keyed.into_iter().map(|(_, candidate)| candidate).collect();
-
-        let mut results: Vec<usize> = Vec::with_capacity(self.config.max_neighbors);
+        let mut results: Vec<usize> = Vec::with_capacity(max_neighbors);
         let mut max_factors = vec![0.0_f64; candidates.len()];
         let mut alpha = 1.0_f64;
-        while alpha <= self.config.max_alpha && results.len() < self.config.max_neighbors {
+        while alpha <= self.config.max_alpha && results.len() < max_neighbors {
             for i in 0..candidates.len() {
-                if results.len() >= self.config.max_neighbors {
+                if results.len() >= max_neighbors {
                     break;
                 }
                 if max_factors[i] > alpha {
@@ -975,28 +1117,28 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
                     }
                     if self.config.has_labels
                         && !label_intersection_preserved(
-                            &base.labels,
-                            &candidates[i].labels,
-                            &candidates[j].labels,
+                            base_labels,
+                            candidates[i].labels,
+                            candidates[j].labels,
                         )
                     {
                         continue;
                     }
                     let between = routing_distance_between(
                         &self.config,
-                        &candidates[i].routing_vector,
-                        &candidates[j].routing_vector,
+                        candidates[i].routing_vector,
+                        candidates[j].routing_vector,
                     )?;
                     max_factors[j] =
-                        max_factors[j].max(distance_factor(distances_to_base[j], between));
+                        max_factors[j].max(distance_factor(candidates[j].distance, between));
                 }
             }
             alpha *= 1.2;
         }
 
-        if results.len() < self.config.max_neighbors {
+        if results.len() < max_neighbors {
             for i in 0..candidates.len() {
-                if results.len() >= self.config.max_neighbors {
+                if results.len() >= max_neighbors {
                     break;
                 }
                 if !results.contains(&i) {
@@ -1117,6 +1259,29 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
 struct RoutingCandidate {
     record: RoutingNodeRecord,
     routing_distance: f32,
+}
+
+/// Borrowed candidate view consumed by the shared α-prune core.
+///
+/// `distance` is the candidate's routing distance to the prune base. Both the
+/// storage-backed insert path and the in-memory bulk build produce these
+/// views without cloning routing vectors or labels.
+#[derive(Debug)]
+struct PruneCandidate<'a> {
+    id: NodeId,
+    distance: f32,
+    routing_vector: &'a RoutingVector,
+    labels: &'a LabelSet,
+}
+
+/// Builds a prune view over an in-memory bulk-build record.
+fn prune_view(record: &NodeRecord, distance: f32) -> PruneCandidate<'_> {
+    PruneCandidate {
+        id: record.id,
+        distance,
+        routing_vector: &record.routing_vector,
+        labels: &record.labels,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1638,21 +1803,21 @@ fn next_node_id_from_snapshot<R: NodeReader>(
     Ok(max_node_id + 1)
 }
 
-fn start_nodes_for_records<I>(records: I) -> crate::graph::StartNodes
+fn start_nodes_for_records<'a, I>(records: I) -> crate::graph::StartNodes
 where
-    I: IntoIterator<Item = RoutingNodeRecord>,
+    I: IntoIterator<Item = (NodeId, &'a LabelSet)>,
 {
-    let records: Vec<_> = records.into_iter().collect();
+    let mut records = records.into_iter().peekable();
     let default_node = records
-        .first()
-        .map(|record| record.id)
+        .peek()
+        .map(|(node_id, _)| *node_id)
         .unwrap_or(EMPTY_START_NODE);
     let mut start_nodes = crate::graph::StartNodes::new(default_node);
     let mut seen_labels = BTreeSet::<Label>::new();
-    for record in records {
-        for label in record.labels.iter() {
+    for (node_id, labels) in records {
+        for label in labels.iter() {
             if seen_labels.insert(*label) {
-                start_nodes.upsert(*label, record.id);
+                start_nodes.upsert(*label, node_id);
             }
         }
     }
@@ -1861,6 +2026,8 @@ fn ensure_neighbor(neighbors: &mut Vec<NodeId>, node_id: NodeId, max_neighbors: 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::distance::DistanceMetric;
     use crate::storage::{
@@ -2153,6 +2320,101 @@ mod tests {
             .search(&query, search_options(3, vectors.len()))
             .unwrap();
         let expected = brute_force(&config, &vectors, &query, None, 3);
+        assert_hit_ids(&actual, &expected);
+    }
+
+    /// Deterministic pseudo-random vector for build-scaling style tests.
+    fn test_vector(seed: u64, dimensions: usize) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (0..dimensions)
+            .map(|dimension| {
+                state = state
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(3037000493 + dimension as u64);
+                let bucket = ((state >> 33) as u32) as f32 / u32::MAX as f32;
+                bucket * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn read_neighbor_lists(
+        index: &StreamingDiskAnnIndex<MemoryStorage>,
+        count: u64,
+    ) -> Vec<Vec<NodeId>> {
+        let snapshot = index.snapshot().unwrap();
+        let ids: Vec<_> = (1..=count).map(NodeId::new).collect();
+        index
+            .storage()
+            .read_nodes(&snapshot, &ids, &QueryBudget::default())
+            .unwrap()
+            .into_iter()
+            .map(|read| match read {
+                NodeRead::Present(record) => record.neighbors,
+                NodeRead::Missing(_) | NodeRead::Tombstoned(_) => panic!("expected present node"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bulk_build_is_deterministic_across_runs() {
+        let mut config = plain_config(8);
+        config.max_neighbors = 4;
+        config.build_search_list_size = 16;
+        let vectors: Vec<_> = (0..80)
+            .map(|idx| input(idx as u64 + 1, &test_vector(idx as u64 + 1, 8)))
+            .collect();
+
+        let first = StreamingDiskAnnIndex::new_memory(config.clone()).unwrap();
+        first.bulk_build(vectors.clone()).unwrap();
+        let second = StreamingDiskAnnIndex::new_memory(config).unwrap();
+        second.bulk_build(vectors).unwrap();
+
+        assert_eq!(
+            read_neighbor_lists(&first, 80),
+            read_neighbor_lists(&second, 80)
+        );
+    }
+
+    #[test]
+    fn bulk_build_with_identical_vectors_keeps_every_node_searchable() {
+        let mut config = plain_config(2);
+        config.max_neighbors = 2;
+        config.build_search_list_size = 4;
+        let vectors: Vec<_> = (0..12)
+            .map(|idx| input(idx as u64 + 1, &[1.0, 1.0]))
+            .collect();
+        let index = StreamingDiskAnnIndex::new_memory(config).unwrap();
+        index.bulk_build(vectors.clone()).unwrap();
+
+        let hits = index
+            .search(&[1.0, 1.0], search_options(vectors.len(), vectors.len()))
+            .unwrap();
+        let mut found: Vec<_> = hits.iter().map(|hit| hit.node_id.get()).collect();
+        found.sort_unstable();
+        assert_eq!(found, (1..=vectors.len() as u64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn bulk_build_with_duplicate_vectors_matches_bruteforce_oracle() {
+        let mut config = plain_config(4);
+        config.max_neighbors = 4;
+        config.build_search_list_size = 16;
+        let mut vectors: Vec<_> = (0..30)
+            .map(|idx| input(idx as u64 + 1, &test_vector(idx as u64 + 1, 4)))
+            .collect();
+        // Duplicate a handful of rows under fresh external IDs.
+        for idx in 0..6 {
+            let duplicate = vectors[idx * 3].full_vector.clone();
+            vectors.push(input(1_000 + idx as u64, &duplicate));
+        }
+        let index = StreamingDiskAnnIndex::new_memory(config.clone()).unwrap();
+        index.bulk_build(vectors.clone()).unwrap();
+
+        let query = test_vector(9_001, 4);
+        let actual = index
+            .search(&query, search_options(10, vectors.len()))
+            .unwrap();
+        let expected = brute_force(&config, &vectors, &query, None, 10);
         assert_hit_ids(&actual, &expected);
     }
 
