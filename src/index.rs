@@ -5,12 +5,13 @@
 //! `scan.rs`, `vacuum.rs`, and the plain/SBQ storage modules, with all Postgres
 //! storage mechanics moved behind traits in `storage`.
 
+use std::borrow::Cow;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::mem::size_of;
 use std::sync::Mutex;
 
-use crate::distance::distance_xor_optimized;
+use crate::distance::{distance_xor_optimized, preprocess_cosine, DistanceMetric};
 use crate::labels::{Label, LabelSetView};
 use crate::sbq::{SbqQuantizer, SbqQuantizerConfig};
 use crate::storage::{
@@ -194,10 +195,14 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
         I: IntoIterator<Item = VectorInput>,
     {
         self.config.validate()?;
-        let vectors: Vec<_> = vectors.into_iter().collect();
-        for vector in &vectors {
+        let mut vectors: Vec<_> = vectors.into_iter().collect();
+        for vector in &mut vectors {
             validate_full_vector(&self.config, &vector.full_vector)?;
             validate_labels(&self.config, &vector.labels)?;
+            // Cosine vectors are normalized before quantizer training, routing
+            // encoding, and full-vector storage so routing and rescore
+            // distances stay mutually consistent.
+            normalize_for_metric(self.config.distance, &mut vector.full_vector);
         }
 
         let (routing_vectors, quantizers) = self.build_routing_vectors(&vectors)?;
@@ -235,6 +240,9 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
         replacement.hot_delta = None;
         replacement.tombstone_epoch = TombstoneEpoch::default();
         replacement.quantizers = quantizers;
+        // Bulk build replaces the visible graph and clears tombstones, so the
+        // node-ID space restarts at the newly assigned IDs.
+        replacement.max_assigned_node_id = Some(NodeId::new(records.len() as u64));
 
         let published = self
             .storage
@@ -266,7 +274,13 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
     ) -> Result<Vec<SearchHit>> {
         snapshot.validate()?;
         options.validate()?;
-        validate_dimension(snapshot.config.dimensions, query.len())?;
+        // Queries must match the index dimension and contain only finite
+        // values, mirroring `validate_full_vector` on the insert path.
+        validate_full_vector(&snapshot.config, query)?;
+        // Cosine queries are normalized exactly like ingested vectors so both
+        // routing and rescore distances compare unit-length vectors.
+        let query = normalized_query_for_metric(snapshot.config.distance, query);
+        let query = query.as_ref();
         enforce_query_budget(&snapshot.config, query, &options.budget)?;
         if snapshot.start_nodes.default_node() == EMPTY_START_NODE
             && snapshot.immutable_segments.is_empty()
@@ -485,6 +499,12 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
     ) -> Result<NodeId> {
         validate_full_vector(&self.config, &full_vector)?;
         validate_labels(&self.config, &labels)?;
+        // Normalize cosine vectors before the mutation log is written so live
+        // inserts and mutation-log replay store byte-identical vectors.
+        // `preprocess_cosine` is idempotent, so replaying an already-normalized
+        // logged vector through this same path is a no-op.
+        let mut full_vector = full_vector;
+        normalize_for_metric(self.config.distance, &mut full_vector);
 
         if append_log {
             self.storage.append_mutation(SerializedMutation::new(
@@ -520,8 +540,11 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
             self.storage.update_start_nodes(start_nodes)?;
         }
 
-        self.publish_hot_delta_over(snapshot)?;
+        // Advance the allocator before publishing so the published manifest's
+        // node-ID high-water mark covers this insert (including replayed
+        // inserts whose IDs were assigned by another index instance).
         self.advance_next_node_id_after(node_id)?;
+        self.publish_hot_delta_over(snapshot)?;
         Ok(node_id)
     }
 
@@ -556,6 +579,16 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
         if let Some(start_nodes) = published.start_nodes {
             replacement.start_nodes = start_nodes;
         }
+        // Keep the manifest's node-ID high-water mark monotonically
+        // non-decreasing across online mutations. The allocator covers every
+        // ID this process has seen (BFS-derived on open plus all allocations
+        // since), which also upgrades legacy manifests without the field.
+        let allocated = self.highest_allocated_node_id()?;
+        replacement.max_assigned_node_id = Some(
+            replacement
+                .max_assigned_node_id
+                .map_or(allocated, |existing| existing.max(allocated)),
+        );
         self.storage
             .compare_and_publish(snapshot.version, replacement)?;
         Ok(())
@@ -867,38 +900,32 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
         mut candidates: Vec<RoutingNodeRecord>,
     ) -> Result<Vec<NodeId>> {
         candidates.retain(|candidate| candidate.id != base.id);
-        candidates.sort_by(|left, right| {
-            routing_distance_between(&self.config, &base.routing_vector, &left.routing_vector)
-                .and_then(|left_distance| {
-                    routing_distance_between(
-                        &self.config,
-                        &base.routing_vector,
-                        &right.routing_vector,
-                    )
-                    .map(|right_distance| (left_distance, right_distance))
-                })
-                .map(|(left_distance, right_distance)| {
-                    rank_distance(left_distance, right_distance)
-                        .then_with(|| left.id.cmp(&right.id))
-                })
-                .unwrap_or(Ordering::Equal)
-        });
-        candidates.dedup_by_key(|candidate| candidate.id);
-        if candidates.len() <= self.config.max_neighbors {
-            return Ok(candidates
-                .into_iter()
-                .map(|candidate| candidate.id)
-                .collect());
-        }
-
-        let mut distances_to_base = Vec::with_capacity(candidates.len());
-        for candidate in &candidates {
-            distances_to_base.push(routing_distance_between(
+        // Compute each candidate's `(distance, id)` sort key once up front so
+        // the comparator never recomputes distances and distance errors are
+        // propagated instead of being mapped to `Ordering::Equal`.
+        let mut keyed = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let distance = routing_distance_between(
                 &self.config,
                 &base.routing_vector,
                 &candidate.routing_vector,
-            )?);
+            )?;
+            keyed.push((distance, candidate));
         }
+        keyed.sort_by(|(left_distance, left), (right_distance, right)| {
+            rank_distance(*left_distance, *right_distance).then_with(|| left.id.cmp(&right.id))
+        });
+        keyed.dedup_by_key(|(_, candidate)| candidate.id);
+        if keyed.len() <= self.config.max_neighbors {
+            return Ok(keyed
+                .into_iter()
+                .map(|(_, candidate)| candidate.id)
+                .collect());
+        }
+
+        let distances_to_base: Vec<f32> = keyed.iter().map(|(distance, _)| *distance).collect();
+        let candidates: Vec<RoutingNodeRecord> =
+            keyed.into_iter().map(|(_, candidate)| candidate).collect();
 
         let mut results: Vec<usize> = Vec::with_capacity(self.config.max_neighbors);
         let mut max_factors = vec![0.0_f64; candidates.len()];
@@ -1045,6 +1072,16 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
             .map_err(|_| Error::Storage("node id allocator mutex was poisoned".to_string()))?;
         *next = (*next).max(node_id.get() + 1);
         Ok(())
+    }
+
+    /// Returns the highest node ID this index instance knows to be assigned,
+    /// or [`NodeId::MIN`] when no assignment is known.
+    fn highest_allocated_node_id(&self) -> Result<NodeId> {
+        let next = self
+            .next_node_id
+            .lock()
+            .map_err(|_| Error::Storage("node id allocator mutex was poisoned".to_string()))?;
+        Ok(NodeId::new(next.saturating_sub(1)))
     }
 }
 
@@ -1448,6 +1485,15 @@ fn next_node_id_from_snapshot<R: NodeReader>(
     reader: &R,
     snapshot: &ManifestSnapshot,
 ) -> Result<u64> {
+    // Manifests written by this crate record the node-ID high-water mark, so
+    // reopen can allocate strictly above every ID ever assigned — including
+    // tombstoned nodes that are no longer reachable from any start node.
+    if let Some(max_assigned) = snapshot.max_assigned_node_id {
+        return Ok(max_assigned.get() + 1);
+    }
+
+    // Legacy fallback for manifests that predate `max_assigned_node_id`: walk
+    // the reachable graph and allocate above the largest ID found.
     let mut queue: VecDeque<_> = snapshot
         .start_nodes
         .all_nodes()
@@ -1525,6 +1571,25 @@ fn validate_full_vector(config: &IndexConfig, vector: &[f32]) -> Result<()> {
         Ok(())
     } else {
         Err(Error::InvalidDistance)
+    }
+}
+
+/// Normalizes `vector` in place when the metric requires it (cosine).
+fn normalize_for_metric(metric: DistanceMetric, vector: &mut [f32]) {
+    if metric == DistanceMetric::Cosine {
+        preprocess_cosine(vector);
+    }
+}
+
+/// Returns the query normalized for the metric, borrowing when no
+/// preprocessing is needed.
+fn normalized_query_for_metric(metric: DistanceMetric, query: &[f32]) -> Cow<'_, [f32]> {
+    if metric == DistanceMetric::Cosine {
+        let mut owned = query.to_vec();
+        preprocess_cosine(&mut owned);
+        Cow::Owned(owned)
+    } else {
+        Cow::Borrowed(query)
     }
 }
 
@@ -2160,6 +2225,183 @@ mod tests {
             node_id: NodeId::new(9),
         };
         assert_eq!(TypedMutation::decode(&delete.encode()).unwrap(), delete);
+    }
+
+    #[test]
+    fn cosine_search_ranks_by_direction_not_magnitude() {
+        let mut config = plain_config(2);
+        config.distance = DistanceMetric::Cosine;
+        // Node 1 is farther from the query direction but has a larger raw
+        // inner product contribution per unit angle than node 2; without
+        // normalization the raw inner products (0.8 vs 0.7 against the
+        // unnormalized query) rank node 1 first.
+        let vectors = vec![input(1101, &[0.4, 0.3]), input(1102, &[0.35, 0.0])];
+        let index = StreamingDiskAnnIndex::new_memory(config).unwrap();
+        index.bulk_build(vectors).unwrap();
+
+        let hits = index.search(&[2.0, 0.0], search_options(2, 2)).unwrap();
+        assert_eq!(hits[0].node_id, NodeId::new(2));
+        assert!(hits[0].distance < hits[1].distance);
+    }
+
+    #[test]
+    fn cosine_clamped_large_magnitude_does_not_beat_exact_direction_match() {
+        let mut config = plain_config(2);
+        config.distance = DistanceMetric::Cosine;
+        // Without normalization both distances clamp to 0.0 ((1 - dot).max(0)
+        // with dot = 50 and dot = 1) and node 1 wins the node-id tie-break.
+        let vectors = vec![input(1111, &[50.0, 50.0]), input(1112, &[1.0, 0.0])];
+        let index = StreamingDiskAnnIndex::new_memory(config).unwrap();
+        index.bulk_build(vectors).unwrap();
+
+        let hits = index.search(&[1.0, 0.0], search_options(2, 2)).unwrap();
+        assert_eq!(hits[0].node_id, NodeId::new(2));
+        assert_eq!(hits[0].distance, 0.0);
+        // The 45-degree-off vector keeps a real, non-collapsed distance.
+        assert!(hits[1].distance > 0.25);
+    }
+
+    #[test]
+    fn cosine_search_matches_bruteforce_oracle_with_unnormalized_inputs() {
+        let mut config = plain_config(3);
+        config.distance = DistanceMetric::Cosine;
+        // Node 2 has a huge magnitude but points away from the query; without
+        // normalization its raw inner product (21.0) clamps its distance to
+        // 0.0 and it wrongly enters the top results.
+        let vectors = vec![
+            input(1121, &[10.0, 0.0, 0.0]),
+            input(1122, &[20.0, -19.0, 0.0]),
+            input(1123, &[3.0, 4.1, 0.0]),
+            input(1124, &[-5.0, -5.0, 1.0]),
+            input(1125, &[0.5, 0.5, 0.5]),
+        ];
+        let index = StreamingDiskAnnIndex::new_memory(config.clone()).unwrap();
+        index.bulk_build(vectors.clone()).unwrap();
+
+        let query = [2.0, 1.0, 0.0];
+        let actual = index
+            .search(&query, search_options(3, vectors.len()))
+            .unwrap();
+        // Oracle: true cosine distances, computed over normalized copies.
+        let normalized_vectors: Vec<_> = vectors
+            .iter()
+            .map(|vector| {
+                let mut vector = vector.clone();
+                preprocess_cosine(&mut vector.full_vector);
+                vector
+            })
+            .collect();
+        let mut normalized_query = query.to_vec();
+        preprocess_cosine(&mut normalized_query);
+        let expected = brute_force(&config, &normalized_vectors, &normalized_query, None, 3);
+        assert_hit_ids(&actual, &expected);
+    }
+
+    #[test]
+    fn mutation_replay_normalizes_cosine_inserts_identically() {
+        let mut config = plain_config(2);
+        config.distance = DistanceMetric::Cosine;
+        let base = vec![input(1151, &[2.0, 0.0]), input(1152, &[0.0, 3.0])];
+        let live = StreamingDiskAnnIndex::new_memory(config.clone()).unwrap();
+        live.bulk_build(base.clone()).unwrap();
+        let inserted = live
+            .insert(1153_u64, vec![5.0, 5.0], LabelSet::default())
+            .unwrap();
+
+        let replayed = StreamingDiskAnnIndex::new_memory(config).unwrap();
+        replayed.bulk_build(base).unwrap();
+        replayed
+            .replay_mutations_from(live.storage(), MutationLogOffset::new(0))
+            .unwrap();
+
+        let query = [4.0, 4.0];
+        let live_hits = live.search(&query, search_options(3, 3)).unwrap();
+        let replayed_hits = replayed.search(&query, search_options(3, 3)).unwrap();
+        assert_eq!(live_hits, replayed_hits);
+        assert_eq!(live_hits[0].node_id, inserted);
+
+        // The replayed store holds the normalized full vector, not the raw
+        // logged magnitude re-normalized twice or not at all.
+        let snapshot = replayed.snapshot().unwrap();
+        let reads = replayed
+            .storage()
+            .read_full_vectors(&snapshot, &[inserted], &QueryBudget::default())
+            .unwrap();
+        let FullVectorRead::Present { vector, .. } = &reads[0] else {
+            panic!("expected replayed insert to be present");
+        };
+        let unit = 0.5_f32.sqrt();
+        assert!((vector[0] - unit).abs() < 1e-6);
+        assert!((vector[1] - unit).abs() < 1e-6);
+    }
+
+    #[test]
+    fn search_rejects_non_finite_query_vectors() {
+        let config = plain_config(2);
+        let vectors = vec![input(1131, &[0.0, 0.0]), input(1132, &[1.0, 0.0])];
+        let index = StreamingDiskAnnIndex::new_memory(config).unwrap();
+        index.bulk_build(vectors).unwrap();
+
+        for query in [
+            [f32::NAN, 0.0],
+            [f32::INFINITY, 0.0],
+            [0.0, f32::NEG_INFINITY],
+        ] {
+            let result = index.search(&query, search_options(1, 2));
+            assert!(matches!(result, Err(Error::InvalidDistance)));
+        }
+    }
+
+    #[test]
+    fn reopen_after_deleting_only_node_does_not_reuse_tombstoned_id() {
+        let config = plain_config(2);
+        let index = StreamingDiskAnnIndex::new_memory(config).unwrap();
+        index.bulk_build(vec![input(1141, &[0.0, 0.0])]).unwrap();
+        index.delete(NodeId::new(1)).unwrap();
+
+        let reopened = StreamingDiskAnnIndex::from_storage(index.into_storage()).unwrap();
+        let inserted = reopened
+            .insert(1142_u64, vec![1.0, 0.0], LabelSet::default())
+            .unwrap();
+        assert_eq!(inserted, NodeId::new(2));
+
+        let snapshot = reopened.snapshot().unwrap();
+        assert_eq!(snapshot.max_assigned_node_id, Some(NodeId::new(2)));
+        let hits = reopened.search(&[1.0, 0.0], search_options(1, 2)).unwrap();
+        assert_eq!(hits[0].node_id, inserted);
+        assert_eq!(hits[0].external_id, ExternalId::new(1142));
+    }
+
+    #[test]
+    fn legacy_manifest_without_high_water_mark_falls_back_to_graph_walk() {
+        let config = plain_config(2);
+        let vectors = vec![
+            input(1161, &[0.0, 0.0]),
+            input(1162, &[1.0, 0.0]),
+            input(1163, &[2.0, 0.0]),
+        ];
+        let index = StreamingDiskAnnIndex::new_memory(config).unwrap();
+        index.bulk_build(vectors).unwrap();
+        let storage = index.into_storage();
+
+        // Simulate a manifest written before `max_assigned_node_id` existed.
+        let current = storage.load_snapshot().unwrap();
+        let mut legacy = current.clone();
+        legacy.max_assigned_node_id = None;
+        storage
+            .compare_and_publish(current.version, legacy)
+            .unwrap();
+
+        // Reopen must derive the next node ID from the reachable graph.
+        let reopened = StreamingDiskAnnIndex::from_storage(storage).unwrap();
+        let inserted = reopened
+            .insert(1164_u64, vec![3.0, 0.0], LabelSet::default())
+            .unwrap();
+        assert_eq!(inserted, NodeId::new(4));
+
+        // The insert publish upgrades the legacy manifest with the mark.
+        let snapshot = reopened.snapshot().unwrap();
+        assert_eq!(snapshot.max_assigned_node_id, Some(NodeId::new(4)));
     }
 
     #[test]

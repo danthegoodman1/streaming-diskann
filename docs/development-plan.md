@@ -49,13 +49,13 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 1A: Cosine normalization on ingest + query | Missing: `preprocess_cosine` calls in `src/index.rs` build/insert/search paths. |
-| Incomplete | Test | 1B: Cosine regression + oracle tests | Missing: committed test reproducing the clamp mis-ranking (repro existed only in review scratch). |
-| Incomplete | Work | 1C: Query finiteness validation at search entry | Missing: check in `search_with_snapshot` + test. |
-| Incomplete | Work | 1D: Precomputed prune sort keys (no error swallowing) | Missing: refactor of `prune_neighbor_records` comparator (`src/index.rs:870`). |
-| Incomplete | Work | 1E: Node-ID high-water mark in `ManifestSnapshot` | Missing: manifest field, writer updates, conformance coverage. |
-| Incomplete | Test | 1F: ID-reuse regression test (delete last node, reopen, insert) | Missing: test asserting fresh ID, not reuse of tombstoned ID. |
-| Incomplete | Gate | Conformance suite green with manifest change | Missing: updated `storage::conformance` + passing run. |
+| Complete | Work | 1A: Cosine normalization on ingest + query | `normalize_for_metric` / `normalized_query_for_metric` in `src/index.rs` normalize in `bulk_build` (before quantizer training/encoding), `apply_insert` (before the mutation log is written, so replay re-normalization is an idempotent no-op), and `search_with_snapshot`. |
+| Complete | Test | 1B: Cosine regression + oracle tests | `cosine_search_ranks_by_direction_not_magnitude`, `cosine_clamped_large_magnitude_does_not_beat_exact_direction_match` ([50,50] vs [1,0] clamp case), `cosine_search_matches_bruteforce_oracle_with_unnormalized_inputs`, `mutation_replay_normalizes_cosine_inserts_identically`; all 4 (plus 1C/1F tests) verified to fail with the fixes reverted. |
+| Complete | Work | 1C: Query finiteness validation at search entry | `search_with_snapshot` now runs `validate_full_vector` on the query (dimension + finiteness, `Error::InvalidDistance`); test `search_rejects_non_finite_query_vectors`. |
+| Complete | Work | 1D: Precomputed prune sort keys (no error swallowing) | `prune_neighbor_records` computes `(distance, id)` keys once, propagates distance errors with `?`, and keeps the distance-then-node-id tie-break; precomputed distances are reused for `distances_to_base`. |
+| Complete | Work | 1E: Node-ID high-water mark in `ManifestSnapshot` | `ManifestSnapshot.max_assigned_node_id: Option<NodeId>` (`None` = legacy manifest → BFS fallback; `Some(NodeId::MIN)` = fresh index). Maintained by `bulk_build` (reset to new range) and `publish_hot_delta_over` (monotonic max with the allocator); `next_node_id_from_snapshot` short-circuits on it. |
+| Complete | Test | 1F: ID-reuse regression test (delete last node, reopen, insert) | `reopen_after_deleting_only_node_does_not_reuse_tombstoned_id` (index test) and `conformance::assert_node_id_high_water_conformance`; new insert gets `NodeId(2)`, not tombstoned `NodeId(1)`. |
+| Complete | Gate | Conformance suite green with manifest change | `storage::conformance` updated: fresh-manifest high-water assertion in `assert_metadata_snapshot_conformance`, new `assert_node_id_high_water_conformance` + `assert_cosine_normalization_conformance` wired into `assert_index_storage_conformance`, cosine-aware `brute_force_hits`. `cargo test` (78 unit + 6 conformance) green; `cargo fmt --check` clean. |
 
 ## Phase 2: Search Hot Path
 

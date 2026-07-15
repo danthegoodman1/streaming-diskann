@@ -78,11 +78,17 @@ example, a production backend could use an LSM for manifest and mutation state,
 object storage for immutable graph segments, and a separate store for full
 vectors while preserving the same query semantics.
 
+Under `DistanceMetric::Cosine`, the index normalizes vectors to unit length on
+ingest (`bulk_build`, `insert`, and mutation-log replay) and normalizes queries
+at search time. Stored full vectors — including those returned through
+`FullVectorReader` — are the normalized values: inserting `[50.0, 50.0]` stores
+and rescores `[0.7071, 0.7071]`.
+
 ### Storage Interfaces
 
 | Interface | Query hot path | Write hot path | Responsibility | Required guarantees |
 | --- | --- | --- | --- | --- |
-| `MetadataStore` | Light | Yes | Stores the latest `ManifestSnapshot`. | `load_snapshot` returns a coherent published snapshot. `compare_and_publish` is an atomic CAS on `ManifestVersion`; on success it assigns the next version and makes the replacement snapshot the visibility boundary for later readers. |
+| `MetadataStore` | Light | Yes | Stores the latest `ManifestSnapshot`. | `load_snapshot` returns a coherent published snapshot. `compare_and_publish` is an atomic CAS on `ManifestVersion`; on success it assigns the next version and makes the replacement snapshot the visibility boundary for later readers. `ManifestSnapshot.max_assigned_node_id` is the node-ID high-water mark: `None` marks a legacy manifest (reopen falls back to a graph walk), and publishing writers must keep it at or above every node ID ever assigned — tombstoning a node never lowers it — so a reopened index can never reuse a tombstoned ID. |
 | `NodeReader` | Yes | Yes | Reads routing-path node records: routing vector, neighbor IDs, labels, and external ID, including records and overlays from the snapshot's published hot delta. | Reads only data visible through the supplied snapshot, returns one `NodeRead` per requested ID in request order, enforces read-batch and query-byte budgets, and does not fetch full vectors. |
 | `FullVectorReader` | If rescoring | Usually | Reads full vectors for exact candidate rescoring, including inserted vectors from the snapshot's published hot delta. | Uses the same snapshot visibility and tombstone rules as `NodeReader`, returns one `FullVectorRead` per requested ID in request order, and enforces rescore-count, full-vector-byte, and query-byte budgets. |
 | `QuantizerStore` | Cache miss/SBQ | Build/SBQ | Stores quantizer models referenced by manifests. | Returned references are exact scope/version handles. Quantizers must be durable before a manifest that references them is published and immutable after publication. |

@@ -193,6 +193,17 @@ pub struct ManifestSnapshot {
     pub hot_delta: Option<HotDeltaRef>,
     pub tombstone_epoch: TombstoneEpoch,
     pub quantizers: Vec<QuantizerReference>,
+    /// Highest internal node ID ever assigned under this manifest lineage.
+    ///
+    /// `Some(NodeId::MIN)` means "no node has been assigned yet"; `None` marks
+    /// a legacy manifest written before this field existed, in which case
+    /// reopen falls back to a reachable-graph traversal to derive the next
+    /// node ID. Online-mutation publishers must keep this monotonically
+    /// non-decreasing (tombstoning a node never lowers it) so reopening an
+    /// index can never reuse a tombstoned node's ID. Bulk build is the one
+    /// exception: it replaces the entire visible graph and clears tombstones,
+    /// so it may reset the mark to the newly assigned ID range.
+    pub max_assigned_node_id: Option<NodeId>,
 }
 
 impl ManifestSnapshot {
@@ -206,6 +217,7 @@ impl ManifestSnapshot {
             hot_delta: None,
             tombstone_epoch: TombstoneEpoch::default(),
             quantizers: Vec::new(),
+            max_assigned_node_id: Some(NodeId::MIN),
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -1455,7 +1467,7 @@ fn validate_neighbors(node_id: NodeId, neighbors: &[NodeId], config: &IndexConfi
 /// semantics, crash recovery outside the shared mutation-log API, operational
 /// tuning, or backend-specific durability guarantees.
 pub mod conformance {
-    use crate::distance::DistanceMetric;
+    use crate::distance::{preprocess_cosine, DistanceMetric};
     use crate::graph::StartNodes;
     use crate::index::{IndexStorage, StreamingDiskAnnIndex, VectorInput};
     use crate::labels::{Label, LabelSetView};
@@ -1556,6 +1568,11 @@ pub mod conformance {
     }
 
     /// Computes exact nearest neighbors for conformance oracles.
+    ///
+    /// For [`DistanceMetric::Cosine`] the oracle normalizes copies of the
+    /// query and candidate vectors, matching the index's ingest/query-time
+    /// normalization, so it computes true cosine distances even for
+    /// unnormalized inputs.
     pub fn brute_force_hits(
         config: &IndexConfig,
         vectors: &[VectorInput],
@@ -1564,6 +1581,11 @@ pub mod conformance {
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
         validate_dimension(config.dimensions, query.len())?;
+        let cosine = config.distance == DistanceMetric::Cosine;
+        let mut query = query.to_vec();
+        if cosine {
+            preprocess_cosine(&mut query);
+        }
         let mut hits = Vec::new();
         for (idx, vector) in vectors.iter().enumerate() {
             validate_dimension(config.dimensions, vector.full_vector.len())?;
@@ -1573,10 +1595,14 @@ pub mod conformance {
                 Some(filter) => vector.labels.overlaps(filter),
             };
             if matches_filter {
+                let mut candidate = vector.full_vector.clone();
+                if cosine {
+                    preprocess_cosine(&mut candidate);
+                }
                 hits.push(SearchHit::new(
                     NodeId::new(idx as u64 + 1),
                     vector.external_id,
-                    config.distance.distance(query, &vector.full_vector),
+                    config.distance.distance(&query, &candidate),
                 )?);
             }
         }
@@ -1695,6 +1721,9 @@ pub mod conformance {
         assert_eq!(initial.version, ManifestVersion::default());
         assert_eq!(initial.config, config);
         assert_eq!(initial.start_nodes, start_nodes);
+        // A fresh backend must report a known (non-legacy) node-ID high-water
+        // mark of "nothing assigned yet".
+        assert_eq!(initial.max_assigned_node_id, Some(NodeId::MIN));
 
         let segment = store.insert_immutable_segment(
             [plain_node_record(1_u64, 101_u64, &[1.0, 0.0, 0.0], &[])],
@@ -1971,6 +2000,66 @@ pub mod conformance {
         assert_low_neighbor_connectivity_conformance(&mut new_storage)?;
         assert_combined_labels_sbq_tombstone_insert_rescore_conformance(&mut new_storage)?;
         assert_bounded_query_conformance(&mut new_storage)?;
+        assert_cosine_normalization_conformance(&mut new_storage)?;
+        assert_node_id_high_water_conformance(&mut new_storage)?;
+        Ok(())
+    }
+
+    /// Verifies cosine indexes normalize unnormalized inputs and queries.
+    ///
+    /// Includes the clamp-collapse case: a large-magnitude vector whose raw
+    /// inner product exceeds 1.0 must not tie with (or beat) an exact
+    /// direction match.
+    pub fn assert_cosine_normalization_conformance<S, F>(mut new_storage: F) -> Result<()>
+    where
+        S: IndexStorage,
+        F: StorageFactory<S>,
+    {
+        let mut config = plain_config(2);
+        config.distance = DistanceMetric::Cosine;
+        let vectors = vec![
+            vector_input(1201_u64, &[50.0, 50.0]),
+            vector_input(1202_u64, &[1.0, 0.0]),
+            vector_input(1203_u64, &[0.4, 0.3]),
+            vector_input(1204_u64, &[0.0, 2.5]),
+        ];
+        let index = new_index(&mut new_storage, config.clone())?;
+        index.bulk_build(vectors.clone())?;
+
+        let query = [3.0, 0.0];
+        let actual = index.search(&query, search_options(vectors.len(), vectors.len()))?;
+        let expected = brute_force_hits(&config, &vectors, &query, None, vectors.len())?;
+        assert_same_hit_identity(&actual, &expected);
+        // Exact direction match wins over the clamped large-magnitude vector.
+        assert_eq!(actual[0].node_id, NodeId::new(2));
+        assert!(actual[0].distance < actual[1].distance);
+        Ok(())
+    }
+
+    /// Verifies the manifest node-ID high-water mark prevents reuse of a
+    /// tombstoned node's ID across reopen.
+    pub fn assert_node_id_high_water_conformance<S, F>(mut new_storage: F) -> Result<()>
+    where
+        S: IndexStorage,
+        F: StorageFactory<S>,
+    {
+        let config = plain_config(2);
+        let index = new_index(&mut new_storage, config)?;
+        index.bulk_build(vec![vector_input(1301_u64, &[0.0, 0.0])])?;
+        assert_eq!(index.snapshot()?.max_assigned_node_id, Some(NodeId::new(1)));
+
+        // Deleting the only node must not lower the high-water mark, even
+        // though the node is no longer reachable from any start node.
+        index.delete(NodeId::new(1))?;
+        assert_eq!(index.snapshot()?.max_assigned_node_id, Some(NodeId::new(1)));
+
+        let reopened = StreamingDiskAnnIndex::from_storage(index.into_storage())?;
+        let inserted = reopened.insert(1302_u64, vec![1.0, 0.0], LabelSet::default())?;
+        assert_eq!(inserted, NodeId::new(2));
+        assert_eq!(
+            reopened.snapshot()?.max_assigned_node_id,
+            Some(NodeId::new(2))
+        );
         Ok(())
     }
 
