@@ -1,0 +1,17 @@
+[package]
+name = "streaming-diskann-node"
+version = "0.2.0"
+edition = "2021"
+license = "PostgreSQL"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+streaming-diskann = { version = "0.2.0", path = ".." }
+
+[build-dependencies]
+napi-build = "2"

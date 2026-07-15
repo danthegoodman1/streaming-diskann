@@ -1,0 +1,48 @@
+{
+  "name": "streaming-diskann",
+  "version": "0.2.0",
+  "description": "Node.js bindings for the streaming-diskann vector index",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "build": "napi build --platform --release --js native.cjs --dts native.d.ts",
+    "test": "npm run build && vitest run"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danthegoodman1/streaming-diskann.git",
+    "directory": "streaming-diskann-node"
+  },
+  "keywords": [
+    "ann",
+    "diskann",
+    "vector-search",
+    "search"
+  ],
+  "author": "Dan Goodman",
+  "license": "PostgreSQL",
+  "engines": {
+    "node": ">=20"
+  },
+  "bugs": {
+    "url": "https://github.com/danthegoodman1/streaming-diskann/issues"
+  },
+  "homepage": "https://github.com/danthegoodman1/streaming-diskann#readme",
+  "devDependencies": {
+    "@napi-rs/cli": "^3.7.2",
+    "@types/node": "^26.1.0",
+    "vitest": "^3.2.4"
+  },
+  "files": [
+    "README.md",
+    "index.js",
+    "index.d.ts",
+    "native.cjs",
+    "native.d.ts",
+    "*.node"
+  ],
+  "napi": {
+    "binaryName": "streaming-diskann-node",
+    "packageName": "streaming-diskann"
+  }
+}
