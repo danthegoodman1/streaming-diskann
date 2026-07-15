@@ -3,7 +3,7 @@
 Node.js bindings for the [`streaming-diskann`](https://github.com/danthegoodman1/streaming-diskann) Rust crate: a StreamingDiskANN vector index exposed as a napi-rs native addon. Create an index over a storage-provider URI, bulk build it from `{ id, vector }` rows, then search, insert, and delete — every method is async and runs off the JS thread on the libuv threadpool.
 
 - **Vectors** are `Float32Array`; **ids** are application-owned `bigint` (full u128 range; plain numbers accepted up to `Number.MAX_SAFE_INTEGER`). External ids must be unique.
-- **Storage** is selected by URI. `memory:` (in-process) is available today; a durable `file:` provider is planned.
+- **Storage** is selected by URI: `memory:` (in-process) or `file:` (durable single-writer directory backend).
 - **Errors** are typed subclasses of `StreamingDiskAnnError`, each with a stable string `.code`.
 
 > The `js` code blocks in this README are executed verbatim by the test suite (`__test__/readme.test.ts`), so they always run as written.
@@ -69,8 +69,8 @@ await reopened.close()
 | URI | Semantics |
 | --- | --- |
 | `memory:` | Anonymous in-process index. `create`/`openOrCreate` always start fresh; `open` rejects with `IndexNotFoundError` (there is nothing to re-open). State is freed when the handle is closed and garbage-collected. |
-| `memory:<name>` | Named in-process index in a process-global registry. `create` rejects with `IndexExistsError` if the name is taken; `open` rejects with `IndexNotFoundError` if it is not. Survives `close()` for the life of the process — **that retention is a deliberate memory leak**: the index's data stays resident until `Index.destroy(uri)` removes it or the process exits. At most **one open handle at a time** (a second `open` rejects with `StorageError` until the first is closed) — the same single-writer discipline the planned durable provider enforces with a lock file. |
-| `file:...` | Not yet supported; planned durable single-writer provider. Rejects with "not yet supported". |
+| `memory:<name>` | Named in-process index in a process-global registry. `create` rejects with `IndexExistsError` if the name is taken; `open` rejects with `IndexNotFoundError` if it is not. Survives `close()` for the life of the process — **that retention is a deliberate memory leak**: the index's data stays resident until `Index.destroy(uri)` removes it or the process exits. At most **one open handle at a time** (a second `open` rejects with `StorageError` until the first is closed) — the same single-writer discipline the `file:` provider enforces with its directory lock. |
+| `file:<dir>` | Durable single-writer index directory (`file:./relative`, `file:/abs/path`, and `file:///abs/path` all work). `create` rejects with `IndexExistsError` when the directory already contains an index; `open` rejects with `IndexNotFoundError` when it does not. The directory is guarded by an exclusive OS-level lock (`flock`) for the life of the handle: a second open — from this or another process — rejects with `StorageError` until the handle is closed or its process exits; a crashed process releases the lock automatically. Every completed operation is durable (fsynced and atomically published) before its promise resolves, so an unclean shutdown reopens to the last completed state. |
 
 ## API
 
@@ -82,11 +82,11 @@ All return `Promise<Index>`.
 - `open` — opens an existing index; rejects with `IndexNotFoundError` when absent. Never creates. Pass `config` to assert it against the stored config (`ConfigMismatchError` on mismatch); omit it to accept the stored config as-is.
 - `openOrCreate` — opens when present (always asserting `config`), creates otherwise.
 
-Opening an existing index rebuilds the internal externalId→nodeId map by scanning the index's node-id space (O(max assigned node id) storage reads). Instant for `memory:` indexes; documented here because the cost grows with index size.
+Opening an existing index rebuilds the internal externalId→nodeId map by scanning the index's node-id space (O(max assigned node id) storage reads). The scan runs on the libuv threadpool inside the returned promise — the JS thread never blocks — but the open itself takes time proportional to index size.
 
 ### `Index.destroy(uri)`
 
-Destroys a named `memory:<name>` index: removes it from the process-global registry so the name can be re-created and its memory is freed. This is the escape hatch for the registry's process-lifetime retention. Rejects with `StorageError` while a handle is still open, `IndexNotFoundError` when the name is not registered, and `InvalidArgumentError` for anonymous `memory:` URIs (nothing is registered to destroy) and `file:` URIs (not yet supported; destroy semantics for durable storage are a later decision).
+Destroys an index by URI. For `memory:<name>` it removes the entry from the process-global registry so the name can be re-created and its memory is freed (the escape hatch for the registry's process-lifetime retention). For `file:<dir>` it deletes the index directory — refusing while any live handle holds the directory lock, and refusing (deleting nothing) when the directory contains files the provider did not write, so a mistyped path can never wipe foreign data. Rejects with `StorageError` in both refusal cases, `IndexNotFoundError` when nothing exists at the URI, and `InvalidArgumentError` for anonymous `memory:` URIs (nothing is registered to destroy).
 
 `config` fields (only `dimensions` is required):
 

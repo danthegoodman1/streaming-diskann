@@ -1,5 +1,5 @@
 [workspace]
-members = ["streaming-diskann-node"]
+members = ["streaming-diskann-file", "streaming-diskann-node"]
 resolver = "2"
 
 [package]

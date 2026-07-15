@@ -1,0 +1,22 @@
+[package]
+name = "streaming-diskann-file"
+version = "0.2.0"
+edition = "2021"
+description = "Durable single-writer file-backed storage provider for streaming-diskann."
+license = "PostgreSQL"
+repository = "https://github.com/danthegoodman1/streaming-diskann"
+# Not published yet; crates.io publication is a Phase 4+ decision.
+publish = false
+
+[lib]
+name = "streaming_diskann_file"
+path = "src/lib.rs"
+
+[dependencies]
+streaming-diskann = { version = "0.2.0", path = ".." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc", "use-std"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

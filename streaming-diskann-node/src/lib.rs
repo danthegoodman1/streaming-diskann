@@ -24,9 +24,29 @@
 //! `Sync`, so no tokio runtime is needed. Writers (bulk build, insert,
 //! delete) are serialized by a per-index lock — see [`IndexState`] — while
 //! searches run in parallel. Factory calls (`create`/`open`/`openOrCreate`)
-//! run synchronously on the JS thread: for the in-process memory provider the
-//! open-time map rebuild is a RAM scan (see [`rebuild_node_ids`]); a durable
-//! provider (Phase 3) must move opening onto the threadpool.
+//! and `destroy` are async tasks too (Phase 3): opening does storage I/O and
+//! the open-time external-ID map rebuild (see [`rebuild_node_ids`]), so both
+//! providers run it on the threadpool.
+//!
+//! # `file:` provider semantics
+//!
+//! - `file:./relative`, `file:/abs/path`, and `file:///abs/path` URIs all
+//!   name an index directory (a leading `//` after the scheme is stripped;
+//!   relative paths resolve against the process working directory). The
+//!   durable format, fsync ordering, and locking live in the
+//!   `streaming-diskann-file` crate.
+//! - `create` errors with `INDEX_EXISTS` when the directory already contains
+//!   an index; `open` errors with `INDEX_NOT_FOUND` when it does not; a
+//!   config supplied to an open path is asserted against the stored manifest
+//!   (`CONFIG_MISMATCH`).
+//! - Single-writer rule: the directory is guarded by an exclusive `flock(2)`
+//!   held for the life of the handle (released by the kernel on process
+//!   death, so crashed processes never leave stale locks). Opening while any
+//!   live handle — this process or another — holds the lock fails with
+//!   `STORAGE`; `close()` releases it.
+//! - `Index.destroy('file:...')` refuses while the lock is held, refuses
+//!   (deleting nothing) if the directory contains files the provider did not
+//!   write, and otherwise removes the index directory.
 //!
 //! # `memory:` provider semantics
 //!
@@ -47,21 +67,24 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use napi::bindgen_prelude::{AsyncTask, BigInt, Float32Array};
 use napi::{Env, Error, Result, Status, Task};
 use napi_derive::napi;
+use streaming_diskann::graph::StartNodes;
 use streaming_diskann::storage::{
     ManifestSnapshot, MemoryStorage, MetadataStore, NodeRead, NodeReader,
 };
 use streaming_diskann::{
     DistanceMetric, Error as CoreError, IndexConfig, Label, LabelSet, NodeId, QueryBudget,
-    SearchOptions, StreamingDiskAnnIndex, VectorInput,
+    Result as CoreResult, SearchHit, SearchOptions, StreamingDiskAnnIndex, VectorInput,
 };
+use streaming_diskann_file::FileStorage;
 
-const SUPPORTED_SCHEMES: &str = "'memory:'";
+const SUPPORTED_SCHEMES: &str = "'memory:' and 'file:'";
 
 /// Builds a napi error whose message carries a stable `[CODE]` prefix that
 /// the JS wrapper parses into a typed error class.
@@ -167,7 +190,16 @@ enum MemoryTarget {
     Named(String),
 }
 
-fn parse_index_uri(uri: &str) -> Result<MemoryTarget> {
+/// Parsed storage-provider target for an index URI.
+enum IndexTarget {
+    Memory(MemoryTarget),
+    /// A `file:` index directory. `file:./relative`, `file:/abs`, and
+    /// `file:///abs` are accepted; a leading `//` after the scheme is
+    /// stripped, so `file:///abs/path` names `/abs/path`.
+    File(PathBuf),
+}
+
+fn parse_index_uri(uri: &str) -> Result<IndexTarget> {
     let Some((scheme, rest)) = uri.split_once(':') else {
         return Err(invalid_arg(format!(
             "invalid index URI '{uri}': expected '<scheme>:...'; supported schemes are {SUPPORTED_SCHEMES}"
@@ -177,14 +209,21 @@ fn parse_index_uri(uri: &str) -> Result<MemoryTarget> {
         "memory" => {
             let name = rest.strip_prefix("//").unwrap_or(rest);
             if name.is_empty() {
-                Ok(MemoryTarget::Anonymous)
+                Ok(IndexTarget::Memory(MemoryTarget::Anonymous))
             } else {
-                Ok(MemoryTarget::Named(name.to_owned()))
+                Ok(IndexTarget::Memory(MemoryTarget::Named(name.to_owned())))
             }
         }
-        "file" => Err(invalid_arg(format!(
-            "the 'file:' scheme is not yet supported; supported schemes are {SUPPORTED_SCHEMES}"
-        ))),
+        "file" => {
+            let path = rest.strip_prefix("//").unwrap_or(rest);
+            if path.is_empty() {
+                Err(invalid_arg(format!(
+                    "invalid index URI '{uri}': 'file:' requires a directory path, e.g. 'file:./my-index' or 'file:///abs/path'"
+                )))
+            } else {
+                Ok(IndexTarget::File(PathBuf::from(path)))
+            }
+        }
         other => Err(invalid_arg(format!(
             "unsupported URI scheme '{other}:' in '{uri}'; supported schemes are {SUPPORTED_SCHEMES}"
         ))),
@@ -200,6 +239,67 @@ fn named_not_found(name: &str) -> Error {
     )
 }
 
+/// Provider-selected index backend. Both variants expose the same core API;
+/// the enum keeps the napi surface free of generics.
+enum Backend {
+    Memory(StreamingDiskAnnIndex<MemoryStorage>),
+    File(StreamingDiskAnnIndex<FileStorage>),
+}
+
+impl Backend {
+    fn snapshot(&self) -> CoreResult<ManifestSnapshot> {
+        match self {
+            Backend::Memory(index) => index.snapshot(),
+            Backend::File(index) => index.snapshot(),
+        }
+    }
+
+    fn search_with_snapshot(
+        &self,
+        snapshot: &ManifestSnapshot,
+        query: &[f32],
+        options: SearchOptions,
+    ) -> CoreResult<Vec<SearchHit>> {
+        match self {
+            Backend::Memory(index) => index.search_with_snapshot(snapshot, query, options),
+            Backend::File(index) => index.search_with_snapshot(snapshot, query, options),
+        }
+    }
+
+    fn bulk_build(&self, inputs: Vec<VectorInput>) -> CoreResult<ManifestSnapshot> {
+        match self {
+            Backend::Memory(index) => index.bulk_build(inputs),
+            Backend::File(index) => index.bulk_build(inputs),
+        }
+    }
+
+    fn insert(&self, external_id: u128, vector: Vec<f32>, labels: LabelSet) -> CoreResult<NodeId> {
+        match self {
+            Backend::Memory(index) => index.insert(external_id, vector, labels),
+            Backend::File(index) => index.insert(external_id, vector, labels),
+        }
+    }
+
+    fn delete(&self, node_id: NodeId) -> CoreResult<()> {
+        match self {
+            Backend::Memory(index) => index.delete(node_id),
+            Backend::File(index) => index.delete(node_id),
+        }
+    }
+
+    fn read_nodes(
+        &self,
+        snapshot: &ManifestSnapshot,
+        node_ids: &[NodeId],
+        budget: &QueryBudget,
+    ) -> CoreResult<Vec<NodeRead>> {
+        match self {
+            Backend::Memory(index) => index.storage().read_nodes(snapshot, node_ids, budget),
+            Backend::File(index) => index.storage().read_nodes(snapshot, node_ids, budget),
+        }
+    }
+}
+
 /// Shared native index state cloned into async tasks.
 struct IndexState {
     /// Process-unique identity of this handle, stamped into every
@@ -207,7 +307,7 @@ struct IndexState {
     /// from a previous open of the same named index) are rejected instead of
     /// silently reading wrong data when segment numbering coincides.
     id: u64,
-    index: StreamingDiskAnnIndex<MemoryStorage>,
+    index: Backend,
     /// Per-index writer state. Write tasks (bulk build, insert, delete) hold
     /// this lock across their **entire** `compute()`, serializing writers so
     /// the core mutation and the `node_ids` update form one critical section.
@@ -267,101 +367,223 @@ pub struct NativeSnapshot {
     index_id: u64,
 }
 
-/// Creates an index for a storage-provider URI (strict-create semantics).
-#[napi]
-pub fn create_index(uri: String, config: NativeIndexConfig) -> Result<NativeIndex> {
-    let target = parse_index_uri(&uri)?;
-    let config = parse_config(config)?;
-    match target {
-        MemoryTarget::Anonymous => anonymous_index(config),
-        MemoryTarget::Named(name) => {
-            let mut registry = lock_or_poisoned(registry())?;
-            if registry.contains_key(&name) {
-                return Err(tagged(
-                    "INDEX_EXISTS",
-                    format!(
-                        "an index named 'memory:{name}' already exists in this process; open it with Index.open() or Index.openOrCreate()"
-                    ),
-                ));
-            }
-            create_named(&mut registry, name, config)
+/// Fully constructed backend state produced on the threadpool; `resolve`
+/// wraps it into a [`NativeIndex`] on the JS thread.
+pub struct FactoryOutput {
+    backend: Backend,
+    node_ids: HashMap<u128, u64>,
+    registry_name: Option<String>,
+}
+
+enum FactoryOp {
+    Create {
+        target: IndexTarget,
+        config: IndexConfig,
+    },
+    Open {
+        target: IndexTarget,
+        config: Option<IndexConfig>,
+    },
+    OpenOrCreate {
+        target: IndexTarget,
+        config: IndexConfig,
+    },
+}
+
+/// Async factory task: create/open/openOrCreate do storage I/O and the
+/// open-time external-ID map rebuild, so they run on the libuv threadpool
+/// for both providers.
+pub struct FactoryTask {
+    op: Option<FactoryOp>,
+}
+
+impl Task for FactoryTask {
+    type Output = FactoryOutput;
+    type JsValue = NativeIndex;
+
+    fn compute(&mut self) -> Result<FactoryOutput> {
+        let op = self
+            .op
+            .take()
+            .ok_or_else(|| storage_error("factory task polled twice"))?;
+        match op {
+            FactoryOp::Create { target, config } => match target {
+                IndexTarget::Memory(MemoryTarget::Anonymous) => anonymous_index(config),
+                IndexTarget::Memory(MemoryTarget::Named(name)) => {
+                    let mut registry = lock_or_poisoned(registry())?;
+                    if registry.contains_key(&name) {
+                        return Err(tagged(
+                            "INDEX_EXISTS",
+                            format!(
+                                "an index named 'memory:{name}' already exists in this process; open it with Index.open() or Index.openOrCreate()"
+                            ),
+                        ));
+                    }
+                    create_named(&mut registry, name, config)
+                }
+                IndexTarget::File(path) => file_create(&path, config),
+            },
+            FactoryOp::Open { target, config } => match target {
+                IndexTarget::Memory(MemoryTarget::Anonymous) => Err(tagged(
+                    "INDEX_NOT_FOUND",
+                    "anonymous 'memory:' indexes cannot be opened; use a named 'memory:<name>' URI",
+                )),
+                IndexTarget::Memory(MemoryTarget::Named(name)) => {
+                    let mut registry = lock_or_poisoned(registry())?;
+                    if !registry.contains_key(&name) {
+                        return Err(named_not_found(&name));
+                    }
+                    open_named(&mut registry, name, config)
+                }
+                IndexTarget::File(path) => file_open(&path, config),
+            },
+            FactoryOp::OpenOrCreate { target, config } => match target {
+                IndexTarget::Memory(MemoryTarget::Anonymous) => anonymous_index(config),
+                IndexTarget::Memory(MemoryTarget::Named(name)) => {
+                    let mut registry = lock_or_poisoned(registry())?;
+                    if registry.contains_key(&name) {
+                        open_named(&mut registry, name, Some(config))
+                    } else {
+                        create_named(&mut registry, name, config)
+                    }
+                }
+                IndexTarget::File(path) => {
+                    if FileStorage::exists(&path) {
+                        file_open(&path, Some(config))
+                    } else {
+                        file_create(&path, config)
+                    }
+                }
+            },
         }
     }
+
+    fn resolve(&mut self, _env: Env, output: FactoryOutput) -> Result<NativeIndex> {
+        Ok(NativeIndex::from_parts(
+            output.backend,
+            output.node_ids,
+            output.registry_name,
+        ))
+    }
+}
+
+/// Creates an index for a storage-provider URI (strict-create semantics).
+#[napi(ts_return_type = "Promise<NativeIndex>")]
+pub fn create_index(uri: String, config: NativeIndexConfig) -> Result<AsyncTask<FactoryTask>> {
+    let target = parse_index_uri(&uri)?;
+    let config = parse_config(config)?;
+    Ok(AsyncTask::new(FactoryTask {
+        op: Some(FactoryOp::Create { target, config }),
+    }))
 }
 
 /// Opens an existing index (strict-open semantics; never creates). When a
 /// config is supplied it is asserted against the stored manifest config.
-#[napi]
-pub fn open_index(uri: String, config: Option<NativeIndexConfig>) -> Result<NativeIndex> {
+#[napi(ts_return_type = "Promise<NativeIndex>")]
+pub fn open_index(
+    uri: String,
+    config: Option<NativeIndexConfig>,
+) -> Result<AsyncTask<FactoryTask>> {
     let target = parse_index_uri(&uri)?;
     let config = config.map(parse_config).transpose()?;
-    let MemoryTarget::Named(name) = target else {
-        return Err(tagged(
-            "INDEX_NOT_FOUND",
-            "anonymous 'memory:' indexes cannot be opened; use a named 'memory:<name>' URI",
-        ));
-    };
-    let mut registry = lock_or_poisoned(registry())?;
-    if !registry.contains_key(&name) {
-        return Err(named_not_found(&name));
-    }
-    open_named(&mut registry, name, config)
+    Ok(AsyncTask::new(FactoryTask {
+        op: Some(FactoryOp::Open { target, config }),
+    }))
 }
 
 /// Opens the index when it exists (asserting the supplied config against the
 /// stored manifest config), otherwise creates it.
-#[napi]
-pub fn open_or_create_index(uri: String, config: NativeIndexConfig) -> Result<NativeIndex> {
+#[napi(ts_return_type = "Promise<NativeIndex>")]
+pub fn open_or_create_index(
+    uri: String,
+    config: NativeIndexConfig,
+) -> Result<AsyncTask<FactoryTask>> {
     let target = parse_index_uri(&uri)?;
     let config = parse_config(config)?;
-    match target {
-        MemoryTarget::Anonymous => anonymous_index(config),
-        MemoryTarget::Named(name) => {
-            let mut registry = lock_or_poisoned(registry())?;
-            if registry.contains_key(&name) {
-                open_named(&mut registry, name, Some(config))
-            } else {
-                create_named(&mut registry, name, config)
+    Ok(AsyncTask::new(FactoryTask {
+        op: Some(FactoryOp::OpenOrCreate { target, config }),
+    }))
+}
+
+/// Async destroy task; deleting a file-backed index does filesystem I/O.
+pub struct DestroyTask {
+    target: Option<IndexTarget>,
+}
+
+impl Task for DestroyTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> Result<()> {
+        let target = self
+            .target
+            .take()
+            .ok_or_else(|| storage_error("destroy task polled twice"))?;
+        match target {
+            IndexTarget::Memory(MemoryTarget::Anonymous) => Err(invalid_arg(
+                "anonymous 'memory:' indexes cannot be destroyed; they are not registered and are freed when the handle is closed and garbage-collected",
+            )),
+            IndexTarget::Memory(MemoryTarget::Named(name)) => {
+                let mut registry = lock_or_poisoned(registry())?;
+                match registry.get(&name) {
+                    None => Err(named_not_found(&name)),
+                    Some(entry) if entry.attached => Err(storage_error(format!(
+                        "index 'memory:{name}' is open; close the handle before destroying it"
+                    ))),
+                    Some(_) => {
+                        registry.remove(&name);
+                        Ok(())
+                    }
+                }
             }
+            IndexTarget::File(path) => match FileStorage::destroy(&path) {
+                Ok(()) => Ok(()),
+                Err(CoreError::StorageNotFound(_)) => Err(tagged(
+                    "INDEX_NOT_FOUND",
+                    format!(
+                        "no index exists at 'file:{}'; nothing to destroy",
+                        path.display()
+                    ),
+                )),
+                // Lock held → STORAGE "…is open; close the handle before
+                // destroying it"; unknown files → STORAGE "refusing to
+                // destroy …" (deletes nothing).
+                Err(err) => Err(core_error(err)),
+            },
         }
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
     }
 }
 
-/// Destroys a named `memory:<name>` index: removes the registry entry so the
-/// name can be re-created and the retained storage is freed. The escape hatch
-/// for the registry's process-lifetime retention (named entries otherwise
-/// survive `close()` forever).
-#[napi]
-pub fn destroy_index(uri: String) -> Result<()> {
+/// Destroys an index by URI. For `memory:<name>` this removes the registry
+/// entry (the escape hatch for the registry's process-lifetime retention);
+/// for `file:` it deletes the index directory under the safety rules
+/// documented on the module.
+#[napi(ts_return_type = "Promise<void>")]
+pub fn destroy_index(uri: String) -> Result<AsyncTask<DestroyTask>> {
     let target = parse_index_uri(&uri)?;
-    let MemoryTarget::Named(name) = target else {
-        return Err(invalid_arg(
-            "anonymous 'memory:' indexes cannot be destroyed; they are not registered and are freed when the handle is closed and garbage-collected",
-        ));
-    };
-    let mut registry = lock_or_poisoned(registry())?;
-    match registry.get(&name) {
-        None => Err(named_not_found(&name)),
-        Some(entry) if entry.attached => Err(storage_error(format!(
-            "index 'memory:{name}' is open; close the handle before destroying it"
-        ))),
-        Some(_) => {
-            registry.remove(&name);
-            Ok(())
-        }
-    }
+    Ok(AsyncTask::new(DestroyTask {
+        target: Some(target),
+    }))
 }
 
-fn anonymous_index(config: IndexConfig) -> Result<NativeIndex> {
+fn anonymous_index(config: IndexConfig) -> Result<FactoryOutput> {
     let index = StreamingDiskAnnIndex::new_memory(config).map_err(core_error)?;
-    Ok(NativeIndex::from_parts(index, HashMap::new(), None))
+    Ok(FactoryOutput {
+        backend: Backend::Memory(index),
+        node_ids: HashMap::new(),
+        registry_name: None,
+    })
 }
 
 fn create_named(
     registry: &mut HashMap<String, RegistryEntry>,
     name: String,
     config: IndexConfig,
-) -> Result<NativeIndex> {
+) -> Result<FactoryOutput> {
     let index = StreamingDiskAnnIndex::new_memory(config).map_err(core_error)?;
     registry.insert(
         name.clone(),
@@ -372,14 +594,18 @@ fn create_named(
             attached: true,
         },
     );
-    Ok(NativeIndex::from_parts(index, HashMap::new(), Some(name)))
+    Ok(FactoryOutput {
+        backend: Backend::Memory(index),
+        node_ids: HashMap::new(),
+        registry_name: Some(name),
+    })
 }
 
 fn open_named(
     registry: &mut HashMap<String, RegistryEntry>,
     name: String,
     config: Option<IndexConfig>,
-) -> Result<NativeIndex> {
+) -> Result<FactoryOutput> {
     let entry = registry
         .get_mut(&name)
         .ok_or_else(|| named_not_found(&name))?;
@@ -392,21 +618,82 @@ fn open_named(
     // `from_storage_with_config` semantics with a friendlier field-level
     // message: the supplied config must equal the stored manifest config.
     if let Some(config) = &config {
-        let snapshot = storage.load_snapshot().map_err(core_error)?;
-        if snapshot.config != *config {
-            return Err(tagged(
-                "CONFIG_MISMATCH",
-                format!(
-                    "stored index config does not match the supplied config: {}",
-                    config_diff(&snapshot.config, config)
-                ),
-            ));
-        }
+        assert_stored_config(&storage, config)?;
     }
     let index = StreamingDiskAnnIndex::from_storage(storage).map_err(core_error)?;
-    let node_ids = rebuild_node_ids(&index)?;
+    let backend = Backend::Memory(index);
+    let node_ids = rebuild_node_ids(&backend)?;
     entry.attached = true;
-    Ok(NativeIndex::from_parts(index, node_ids, Some(name)))
+    Ok(FactoryOutput {
+        backend,
+        node_ids,
+        registry_name: Some(name),
+    })
+}
+
+fn file_create(path: &std::path::Path, config: IndexConfig) -> Result<FactoryOutput> {
+    if FileStorage::exists(path) {
+        return Err(tagged(
+            "INDEX_EXISTS",
+            format!(
+                "an index already exists at 'file:{}'; open it with Index.open() or Index.openOrCreate()",
+                path.display()
+            ),
+        ));
+    }
+    let initial =
+        ManifestSnapshot::initial(config, StartNodes::new(NodeId::MIN)).map_err(core_error)?;
+    let storage = FileStorage::create(path, initial).map_err(core_error)?;
+    let index = StreamingDiskAnnIndex::from_storage(storage).map_err(core_error)?;
+    Ok(FactoryOutput {
+        backend: Backend::File(index),
+        node_ids: HashMap::new(),
+        registry_name: None,
+    })
+}
+
+fn file_open(path: &std::path::Path, config: Option<IndexConfig>) -> Result<FactoryOutput> {
+    let storage = match FileStorage::open(path) {
+        Ok(storage) => storage,
+        Err(CoreError::StorageNotFound(_)) => {
+            return Err(tagged(
+                "INDEX_NOT_FOUND",
+                format!(
+                    "no index exists at 'file:{}'; create it with Index.create() or Index.openOrCreate()",
+                    path.display()
+                ),
+            ))
+        }
+        // Lock conflicts and I/O failures surface as STORAGE.
+        Err(err) => return Err(core_error(err)),
+    };
+    if let Some(config) = &config {
+        assert_stored_config(&storage, config)?;
+    }
+    let index = StreamingDiskAnnIndex::from_storage(storage).map_err(core_error)?;
+    let backend = Backend::File(index);
+    let node_ids = rebuild_node_ids(&backend)?;
+    Ok(FactoryOutput {
+        backend,
+        node_ids,
+        registry_name: None,
+    })
+}
+
+/// Asserts the stored manifest config equals the supplied config
+/// (`from_storage_with_config` semantics with a field-level diff message).
+fn assert_stored_config<S: MetadataStore>(storage: &S, config: &IndexConfig) -> Result<()> {
+    let snapshot = storage.load_snapshot().map_err(core_error)?;
+    if snapshot.config != *config {
+        return Err(tagged(
+            "CONFIG_MISMATCH",
+            format!(
+                "stored index config does not match the supplied config: {}",
+                config_diff(&snapshot.config, config)
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Human-readable list of config fields that differ (stored vs supplied).
@@ -475,11 +762,11 @@ fn config_diff(stored: &IndexConfig, supplied: &IndexConfig) -> String {
 /// densely from 1, so the map is reconstructed by reading node IDs
 /// `1..=max_assigned` in batches through the snapshot's routing-read path and
 /// keeping the `Present` records (tombstoned and missing IDs are skipped).
-/// Cost: O(max assigned node ID) storage reads at open time — a RAM scan for
-/// the memory provider. A durable provider (Phase 3) should either persist
-/// the map or move this scan onto the threadpool.
-fn rebuild_node_ids(index: &StreamingDiskAnnIndex<MemoryStorage>) -> Result<HashMap<u128, u64>> {
-    let snapshot = index.snapshot().map_err(core_error)?;
+/// Cost: O(max assigned node ID) storage reads at open time; both providers
+/// run it inside the async [`FactoryTask`] on the libuv threadpool, so the
+/// JS thread never blocks on it.
+fn rebuild_node_ids(backend: &Backend) -> Result<HashMap<u128, u64>> {
+    let snapshot = backend.snapshot().map_err(core_error)?;
     let Some(max_assigned) = snapshot.max_assigned_node_id else {
         return Err(storage_error(
             "index manifest predates node-ID high-water tracking; cannot rebuild the external-ID map",
@@ -499,8 +786,7 @@ fn rebuild_node_ids(index: &StreamingDiskAnnIndex<MemoryStorage>) -> Result<Hash
             .saturating_add(budget.max_read_batch as u64 - 1)
             .min(max_assigned);
         let chunk: Vec<NodeId> = (next..=end).map(NodeId::new).collect();
-        let reads = index
-            .storage()
+        let reads = backend
             .read_nodes(&snapshot, &chunk, &budget)
             .map_err(core_error)?;
         for read in reads {
@@ -568,8 +854,9 @@ impl NativeIndex {
         }))
     }
 
-    /// Pins the currently published manifest snapshot. Cheap for the memory
-    /// provider (a metadata clone under a mutex), so it runs synchronously.
+    /// Pins the currently published manifest snapshot. Cheap for both
+    /// providers (a clone of the in-memory manifest under a mutex; the file
+    /// provider caches its manifest), so it runs synchronously.
     #[napi]
     pub fn snapshot(&self) -> Result<NativeSnapshot> {
         let state = self.live_state()?;
@@ -597,7 +884,9 @@ impl NativeIndex {
     /// Releases the native handle. Later calls on this instance fail with a
     /// clear "index is closed" error, which the async wrapper surfaces as a
     /// promise rejection. Named memory indexes stay registered (and can be
-    /// re-opened) after close.
+    /// re-opened) after close; file-backed indexes release their directory
+    /// lock (once in-flight tasks finish) so the directory can be re-opened
+    /// or destroyed.
     #[napi]
     pub fn close(&self) -> Result<()> {
         *lock_or_poisoned(&self.state)? = None;
@@ -608,7 +897,7 @@ impl NativeIndex {
     }
 
     fn from_parts(
-        index: StreamingDiskAnnIndex<MemoryStorage>,
+        index: Backend,
         node_ids: HashMap<u128, u64>,
         registry_name: Option<String>,
     ) -> Self {

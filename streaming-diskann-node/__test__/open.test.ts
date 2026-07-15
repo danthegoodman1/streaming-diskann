@@ -203,16 +203,12 @@ test('destroy of a missing name rejects with IndexNotFoundError', async () => {
   expect(error.code).toBe('INDEX_NOT_FOUND')
 })
 
-test('destroy of anonymous memory: and file: URIs rejects with InvalidArgumentError', async () => {
+test('destroy of anonymous memory: URIs rejects with InvalidArgumentError', async () => {
   const anonymous = await Index.destroy('memory:').catch((e) => e)
   expect(anonymous).toBeInstanceOf(InvalidArgumentError)
   expect(anonymous.message).toMatch(/anonymous 'memory:' indexes cannot be destroyed/)
-
-  // file: destroy semantics are a Phase 3 decision; today the scheme itself
-  // is rejected as not yet supported.
-  const file = await Index.destroy('file:./somewhere').catch((e) => e)
-  expect(file).toBeInstanceOf(InvalidArgumentError)
-  expect(file.message).toMatch(/'file:' scheme is not yet supported/)
+  // file: destroy semantics (including destroy-of-missing → IndexNotFoundError)
+  // are covered in file.test.ts.
 })
 
 test('memory:// prefix is equivalent to memory: for anonymous and named URIs', async () => {

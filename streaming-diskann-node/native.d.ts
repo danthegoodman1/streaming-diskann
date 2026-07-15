@@ -12,8 +12,9 @@ export declare class NativeIndex {
    */
   searchWithSnapshot(vector: Float32Array, options: NativeSearchOptions, snapshot: NativeSnapshot): Promise<unknown>
   /**
-   * Pins the currently published manifest snapshot. Cheap for the memory
-   * provider (a metadata clone under a mutex), so it runs synchronously.
+   * Pins the currently published manifest snapshot. Cheap for both
+   * providers (a clone of the in-memory manifest under a mutex; the file
+   * provider caches its manifest), so it runs synchronously.
    */
   snapshot(): NativeSnapshot
   insert(item: NativeItem): Promise<unknown>
@@ -22,7 +23,9 @@ export declare class NativeIndex {
    * Releases the native handle. Later calls on this instance fail with a
    * clear "index is closed" error, which the async wrapper surfaces as a
    * promise rejection. Named memory indexes stay registered (and can be
-   * re-opened) after close.
+   * re-opened) after close; file-backed indexes release their directory
+   * lock (once in-flight tasks finish) so the directory can be re-opened
+   * or destroyed.
    */
   close(): void
 }
@@ -43,15 +46,15 @@ export declare class NativeSnapshot {
 }
 
 /** Creates an index for a storage-provider URI (strict-create semantics). */
-export declare function createIndex(uri: string, config: NativeIndexConfig): NativeIndex
+export declare function createIndex(uri: string, config: NativeIndexConfig): Promise<NativeIndex>
 
 /**
- * Destroys a named `memory:<name>` index: removes the registry entry so the
- * name can be re-created and the retained storage is freed. The escape hatch
- * for the registry's process-lifetime retention (named entries otherwise
- * survive `close()` forever).
+ * Destroys an index by URI. For `memory:<name>` this removes the registry
+ * entry (the escape hatch for the registry's process-lifetime retention);
+ * for `file:` it deletes the index directory under the safety rules
+ * documented on the module.
  */
-export declare function destroyIndex(uri: string): void
+export declare function destroyIndex(uri: string): Promise<void>
 
 export interface NativeHit {
   id: bigint
@@ -99,10 +102,10 @@ export interface NativeSearchOptions {
  * Opens an existing index (strict-open semantics; never creates). When a
  * config is supplied it is asserted against the stored manifest config.
  */
-export declare function openIndex(uri: string, config?: NativeIndexConfig | undefined | null): NativeIndex
+export declare function openIndex(uri: string, config?: NativeIndexConfig | undefined | null): Promise<NativeIndex>
 
 /**
  * Opens the index when it exists (asserting the supplied config against the
  * stored manifest config), otherwise creates it.
  */
-export declare function openOrCreateIndex(uri: string, config: NativeIndexConfig): NativeIndex
+export declare function openOrCreateIndex(uri: string, config: NativeIndexConfig): Promise<NativeIndex>

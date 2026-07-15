@@ -147,7 +147,7 @@ test('semantic argument errors from the native layer reject with InvalidArgument
   await expect(index.insert({ id: 1n, vector: vec(7, 7, 7) })).rejects.toThrow(
     InvalidArgumentError
   )
-  await expect(Index.create('file:./x', CONFIG)).rejects.toThrow(InvalidArgumentError)
+  await expect(Index.create('s3://bucket/x', CONFIG)).rejects.toThrow(InvalidArgumentError)
   // Core-validated search options surface as InvalidArgumentError too.
   await expect(index.search(vec(0, 0, 0), { limit: 5, searchListSize: 2 })).rejects.toThrow(
     InvalidArgumentError

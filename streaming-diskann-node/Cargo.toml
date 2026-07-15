@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 napi = { version = "3", default-features = false, features = ["napi8"] }
 napi-derive = "3"
 streaming-diskann = { version = "0.2.0", path = ".." }
+streaming-diskann-file = { version = "0.2.0", path = "../streaming-diskann-file" }
 
 [build-dependencies]
 napi-build = "2"

@@ -193,11 +193,18 @@ export declare class StorageError extends StreamingDiskAnnError {
  * {@link Index.open}, or {@link Index.openOrCreate}; all methods return
  * promises and run index work off the JS thread.
  *
- * Supported URIs: `memory:` (anonymous, always fresh, cannot be re-opened)
- * and `memory:<name>` (registered process-wide; survives `close()` for the
+ * Supported URIs: `memory:` (anonymous, always fresh, cannot be re-opened),
+ * `memory:<name>` (registered process-wide; survives `close()` for the
  * life of the process — deliberately leaking its memory until
  * {@link Index.destroy} removes it — with at most one open handle at a
- * time). The `file:` scheme is planned but not yet supported.
+ * time), and `file:<dir>` (durable single-writer directory backend;
+ * `file:./relative`, `file:/abs/path`, and `file:///abs/path` are accepted).
+ * A file-backed index directory is guarded by an exclusive OS-level lock for
+ * the life of the handle: opening it again — from this or another process —
+ * rejects with {@link StorageError} until the handle is closed or its
+ * process exits (a crashed process releases the lock automatically). Every
+ * completed operation is durable on disk, so an unclean shutdown reopens to
+ * the last published state.
  *
  * Concurrency: mutations issued through one handle are serialized
  * internally; searches run in parallel with each other and with writers.
@@ -226,16 +233,23 @@ export declare class Index {
    */
   static openOrCreate(uri: string, config: IndexConfig): Promise<Index>
   /**
-   * Destroys a named `memory:<name>` index: removes it from the
-   * process-global registry so the name can be re-created and its memory is
-   * freed. This is the escape hatch for the registry's process-lifetime
-   * retention — named indexes otherwise survive {@link Index.close} until
-   * the process exits, which is a deliberate memory leak.
+   * Destroys an index by URI.
    *
-   * Rejects with {@link StorageError} while a handle is still open,
-   * {@link IndexNotFoundError} when the name is not registered, and
-   * {@link InvalidArgumentError} for anonymous `memory:` URIs (nothing is
-   * registered to destroy) and `file:` URIs (not yet supported).
+   * For `memory:<name>`: removes it from the process-global registry so the
+   * name can be re-created and its memory is freed. This is the escape
+   * hatch for the registry's process-lifetime retention — named indexes
+   * otherwise survive {@link Index.close} until the process exits, which is
+   * a deliberate memory leak.
+   *
+   * For `file:<dir>`: deletes the index directory. It refuses while any
+   * live handle holds the directory lock and refuses — deleting nothing —
+   * when the directory contains files the provider did not write, so a
+   * mistyped path can never wipe foreign data (both reject with
+   * {@link StorageError}).
+   *
+   * Rejects with {@link IndexNotFoundError} when nothing exists at the URI
+   * and {@link InvalidArgumentError} for anonymous `memory:` URIs (nothing
+   * is registered to destroy).
    */
   static destroy(uri: string): Promise<void>
   /**

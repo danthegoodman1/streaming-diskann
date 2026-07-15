@@ -80,16 +80,15 @@ test('delete removes the row from search results', async () => {
 })
 
 test('unsupported URI schemes reject and name the supported schemes', async () => {
-  // file: is planned (Phase 3), so it gets dedicated "not yet supported"
-  // phrasing rather than the generic unknown-scheme error.
-  await expect(Index.create('file:./somewhere', CONFIG)).rejects.toThrow(
-    /the 'file:' scheme is not yet supported.*supported schemes are 'memory:'/
-  )
   await expect(Index.create('s3://bucket/index', CONFIG)).rejects.toThrow(
-    /unsupported URI scheme 's3:'.*supported schemes are 'memory:'/
+    /unsupported URI scheme 's3:'.*supported schemes are 'memory:' and 'file:'/
   )
   await expect(Index.create('not-a-uri', CONFIG)).rejects.toThrow(
-    /invalid index URI 'not-a-uri'.*supported schemes are 'memory:'/
+    /invalid index URI 'not-a-uri'.*supported schemes are 'memory:' and 'file:'/
+  )
+  // file: is supported (Phase 3) but requires a path.
+  await expect(Index.create('file:', CONFIG)).rejects.toThrow(
+    /'file:' requires a directory path/
   )
 })
 
