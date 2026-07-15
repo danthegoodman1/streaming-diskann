@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-release-gates:
+    runs-on: ubuntu-26.04
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'streaming-diskann-file/Cargo.toml', 'streaming-diskann-node/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Check release version script
+        run: |
+          node --test scripts/release-version.test.mjs
+          node scripts/release-version.mjs check "$(node scripts/release-version.mjs next --bump current)"
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+      - run: cargo publish --dry-run --locked -p streaming-diskann
+
+  node:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, macos-26]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-node-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'streaming-diskann-file/Cargo.toml', 'streaming-diskann-node/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-node-
+            ${{ runner.os }}-cargo-
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: streaming-diskann-node/package-lock.json
+      - run: npm ci
+        working-directory: streaming-diskann-node
+      - run: npm test
+        working-directory: streaming-diskann-node
+      - run: npm publish --dry-run --access public
+        working-directory: streaming-diskann-node

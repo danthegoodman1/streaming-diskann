@@ -14,7 +14,7 @@
 //! rejections only transport a message string). The wrapper parses the prefix
 //! and rethrows the matching typed error class; see `translateNativeError` in
 //! `index.js`. Core [`streaming_diskann::Error`] variants map via
-//! [`error_code`].
+//! `error_code`.
 //!
 //! # Threading
 //!
@@ -22,10 +22,10 @@
 //! threadpool via napi [`AsyncTask`]s, so every JS-visible method returns a
 //! promise and the JS thread never blocks. The core crate is synchronous and
 //! `Sync`, so no tokio runtime is needed. Writers (bulk build, insert,
-//! delete) are serialized by a per-index lock — see [`IndexState`] — while
+//! delete) are serialized by a per-index lock — see `IndexState` — while
 //! searches run in parallel. Factory calls (`create`/`open`/`openOrCreate`)
 //! and `destroy` are async tasks too (Phase 3): opening does storage I/O and
-//! the open-time external-ID map rebuild (see [`rebuild_node_ids`]), so both
+//! the open-time external-ID map rebuild (see `rebuild_node_ids`), so both
 //! providers run it on the threadpool.
 //!
 //! # `file:` provider semantics
