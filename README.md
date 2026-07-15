@@ -78,6 +78,15 @@ example, a production backend could use an LSM for manifest and mutation state,
 object storage for immutable graph segments, and a separate store for full
 vectors while preserving the same query semantics.
 
+`bulk_build` uses incremental Vamana construction: each point picks its
+neighbors from a bounded greedy search of the partial graph
+(`IndexConfig::build_search_list_size` candidates) rather than from all other
+points. This makes the build roughly O(n · search) instead of O(n²), at a small
+recall cost from the approximate candidate pools (measured here: recall@10 of
+0.983 vs 1.000 for an exhaustive build at n=5000, dims=32). To trade speed back
+for recall, raise the query-time `search_list_size` (per-query cost, no
+rebuild) or `build_search_list_size` (build-time cost).
+
 Under `DistanceMetric::Cosine`, the index normalizes vectors to unit length on
 ingest (`bulk_build`, `insert`, and mutation-log replay) and normalizes queries
 at search time. Stored full vectors — including those returned through

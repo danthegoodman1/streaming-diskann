@@ -197,6 +197,15 @@ impl<S: IndexStorage> StreamingDiskAnnIndex<S> {
     /// index: existing immutable segments, hot-delta references, and tombstone
     /// epochs are cleared in the published manifest. Use it when the caller has
     /// the full dataset to build at once, not for single-row online updates.
+    ///
+    /// The graph is built with incremental Vamana construction: each point's
+    /// neighbors are chosen from a bounded greedy search of the partial graph
+    /// ([`IndexConfig::build_search_list_size`](crate::IndexConfig) candidates),
+    /// not from an exhaustive scan of all points. The build is therefore
+    /// roughly O(n · search) rather than O(n²), at a small recall cost from the
+    /// approximate candidate pools. Raising `build_search_list_size` improves
+    /// graph quality at build-time cost; raising the query-time
+    /// `search_list_size` recovers recall per query without a rebuild.
     pub fn bulk_build<I>(&self, vectors: I) -> Result<ManifestSnapshot>
     where
         I: IntoIterator<Item = VectorInput>,

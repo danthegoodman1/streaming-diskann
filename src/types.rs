@@ -108,6 +108,13 @@ impl QuantizerConfig {
 ///
 /// `dimensions` is the full-vector width. `routing_dimensions` can be smaller
 /// when the graph should route on a prefix and rescore with full vectors.
+///
+/// `build_search_list_size` bounds the greedy-search candidate pool that
+/// [`bulk_build`](crate::StreamingDiskAnnIndex::bulk_build) uses when choosing
+/// each point's neighbors. Larger values build a higher-recall graph at higher
+/// build cost; the query-time `search_list_size` in
+/// [`SearchOptions`](crate::SearchOptions) can also recover recall per query
+/// without rebuilding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexConfig {
     pub dimensions: usize,
