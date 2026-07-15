@@ -6,6 +6,20 @@ Fix the correctness and performance issues found in the 2026-07-14 code review s
 
 Review baseline evidence: cosine mis-ranking reproduced with a two-vector index (45°-off large-magnitude vector ties at distance 0.0 with an exact-direction match); `bulk_build` measured at 101ms / 349ms / 1.49s for n = 500 / 1000 / 2000 (≈4.3× per doubling, dims=32, release build).
 
+Recorded outcome (2026-07-15, all phases complete, same machine, release build; before = commit `6a1b8e2`, after = commit `b72b908`):
+
+| Benchmark | Before | After | Change |
+| --- | --- | --- | --- |
+| `graph_walk_search_no_rescore` | 199.8 µs/op | 159.5–171.9 µs/op | ~15–20% faster |
+| `end_to_end_search_with_rescore` | 203.4 µs/op | 159.5–167.9 µs/op | ~18–22% faster |
+| `sbq_quantization` | 0.102 µs/op | 0.078 µs/op | ~24% faster |
+| `full_vector_rescore` | 0.037 µs/op | 0.037 µs/op | unchanged (storage-dominated; kernel itself 2.6× at dims=32) |
+| `bulk_build` n=500 / 1k / 2k / 4k | 121 / 361 / 1575 / 6598 ms | 50 / 80 / 189 / 433 ms | 2.4× / 4.5× / 8.3× / 15.2× faster |
+| Build scaling ratio n=2k→4k | 4.19 | 2.29 | gate < 3.0 met |
+| recall@10, n=5000, 100 queries | 1.0000 | 0.9830 | gate ≥ 0.98 met |
+
+Correctness fixes (cosine ranking, query validation, prune error propagation, node-ID reuse) are covered by regression tests listed in the phase ledgers below.
+
 ## Implementation Principles
 
 - Correctness fixes land before performance work; every fix ships with a regression test that fails on the current code.
