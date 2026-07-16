@@ -1,6 +1,6 @@
 {
   "name": "streaming-diskann",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Node.js bindings for the streaming-diskann vector index",
   "main": "index.js",
   "types": "index.d.ts",

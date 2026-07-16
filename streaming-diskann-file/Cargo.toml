@@ -1,6 +1,6 @@
 [package]
 name = "streaming-diskann-file"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Durable single-writer file-backed storage provider for streaming-diskann."
 license = "PostgreSQL"
@@ -13,7 +13,7 @@ name = "streaming_diskann_file"
 path = "src/lib.rs"
 
 [dependencies]
-streaming-diskann = { version = "0.2.0", path = ".." }
+streaming-diskann = { version = "0.2.1", path = ".." }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 postcard = { version = "1", features = ["alloc", "use-std"] }
